@@ -72,8 +72,8 @@ class HybridEngine:
         
         # ---- syzygy ----
         self.tablebase = None
-        if model_cfg and model_cfg.syzygy_path:
-            tb_path = Path(model_cfg.syzygy_path)
+        if self.model_cfg and self.model_cfg.syzygy_path: # Use self.model_cfg
+            tb_path = Path(self.model_cfg.syzygy_path) # Use self.model_cfg
             if tb_path.exists() and any(tb_path.iterdir()):
                 try:
                     self.tablebase = chess.syzygy.open_tablebase(str(tb_path))
@@ -222,8 +222,8 @@ class HybridEngine:
         
         # Pass syzygy path if available
         tb_path_str = None
-        if self.tablebase is not None and model_cfg and model_cfg.syzygy_path:
-            tb_path_str = model_cfg.syzygy_path
+        if self.tablebase is not None and self.model_cfg and self.model_cfg.syzygy_path:
+            tb_path_str = self.model_cfg.syzygy_path
             
         rust_mcts = chess_engine_core.RustMCTS(fen, cpuct, discount, tb_path_str)
 
