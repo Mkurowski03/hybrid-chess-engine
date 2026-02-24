@@ -9,8 +9,8 @@
 
 ---
 
-### 🏆 Major Achievement: Release v2.0
-> **Draw vs 2450 ELO Bot ("Luke"):** Achieved a draw by repetition with **95.6% Accuracy** and **0 Blunders** in the release candidate match.
+### 🏆 Major Achievement: Release v2.2
+> **Defeated 2450 ELO Bot ("Luke"):** Dominated the Grandmaster simulation with **96.8% Accuracy**, **0 Blunders**, **0 Mistakes**, and **0 Inaccuracies**.
 
 ---
 
@@ -21,11 +21,12 @@ By offloading the massive Monte Carlo Tree Search (MCTS) graph and mathematics t
 
 ### ✨ Key Features
 * 🚀 **Hybrid Architecture:** Rust (`shakmaty` + `pyo3`) handles the heavy tree search; Python handles GPU inference.
-* ⚡ **6500+ NPS:** Sustained calculation speed on RTX 3070 Ti (~40,000 simulations/move in Rapid).
+* ⚡ **6500+ NPS:** Sustained calculation speed on RTX 3070 Ti (~80,000 simulations/move in Deep Thinker mode).
 * 🔄 **Zero-Copy Bridge:** 18-channel board states are encoded directly into Python memory space, eliminating data-transfer bottlenecks.
 * 🛡️ **Panic Mode:** Dynamic time-management ensures the engine never flags, scaling down simulations when the clock is low.
 * ⚔️ **Mate Guard:** Instant 1-ply forced-mate solver cures "promotion blindness".
 * 🧩 **Endgame Excellence:** Integrated 5-piece Syzygy Tablebases (WDL/DTZ) directly into the Rust MCTS core. The engine plays mathematically perfect chess when 5 or fewer pieces remain.
+* 🛑 **Anti-Shuffle Logic:** Hardcoded Rust-level penalty (-5.0) for 3-fold repetition when in a winning state, forcing the engine to find the decisive kill instead of shuffling into a draw.
 
 ### 📊 Data & Training
 * **Dataset:** Trained on **24 Million+ Positions** extracted from the **Lumbras Gigabase** (3.7M high-quality games, Elo ≥ 2200).

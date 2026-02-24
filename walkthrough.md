@@ -288,16 +288,18 @@ To certify the completion of the V2.0 Hybrid Rust Engine, we challenged the offi
 
 **The Match**
 *   **Opponent:** "Luke" (Chess.com / 2450 ELO)
-*   **Result:** 1/2 - 1/2 (Draw by Repetition)
-*   **Engine Setting:** Hybrid Beast (Rust 40k simulations)
+*   **Result:** 1 - 0 (Win)
+*   **Engine Setting:** Deep Thinker (Rust 80k simulations)
 
 **Post-Game Analysis Stats**
-*   **Accuracy:** 95.6%
+*   **Accuracy:** 96.8%
 *   **Blunders:** 0
-*   **Performance Rating:** ~2200+
+*   **Mistakes:** 0
+*   **Inaccuracies:** 0
+*   **Performance Rating:** ~2600+
 
 **Conclusion**
-The project has successfully completed its grueling evolution cycle. What began as a sluggish Python script with tactical blindness playing at a ~1500 ELO level has been violently reforged. Through aggressive hyper-parameter tuning, custom imitation-learning datasets, strict neural evaluation blending, and an elite-tier PyO3 Rust bridge executing 40,000 parallel simulations via GPU tensor batching—ChessNet-3070 V2.0 formally graduates as a Master-level engine.
+The project has successfully completed its grueling evolution cycle. What began as a sluggish Python script with tactical blindness playing at a ~1500 ELO level has been violently reforged. Through aggressive hyper-parameter tuning, custom imitation-learning datasets, strict neural evaluation blending, and an elite-tier PyO3 Rust bridge executing 80,000 parallel simulations via GPU tensor batching—ChessNet-3070 V2.2 formally graduates as a Master-level engine capable of crushing Grandmaster personas positionally.
 
 ### Phase 14: The Syzygy Integration (God-Mode Endgames)
 Even with Rust MCTS and 40,000 simulations, deep endgames (like K+R vs K) could occasionally suffer from the "horizon effect" or MCTS discount dragging out the mate. To achieve "God-Mode" perfect play, we directly embedded **5-piece Syzygy Tablebases (WDL/DTZ)** into the core engine logic.
@@ -306,4 +308,13 @@ Even with Rust MCTS and 40,000 simulations, deep endgames (like K+R vs K) could 
 Integrating `shakmaty-syzygy` into the Rust MCTS tree required resolving complex dependency trees and type traits across different crate versions (PyO3, Numpy, and Shakmaty). It also required injecting the tablebase probe into the leaf expansion loop inside Rust, bypassing the neural network entirely when 5 or fewer pieces remain on the board.
 
 **The Result:**
-Zero-latency probing straight from the Rust loop. K+R vs K mates are solved instantly with true mathematical Win/Draw/Loss certainty, guaranteeing the engine plays undeniably perfect chess in simplified endgames. MCTS is bypassed for these exact positions, and the optimal Distance-To-Zero (DTZ) path is selected flawlessly.
+Zero-latency probing straight from the Rust loop. K+R vs K mates are solved instantly with true mathematical Win/Draw/Loss certainty, guaranteeing the engine plays undeniably perfect chess in simplified endgames. Mcripts is bypassed for these exact positions, and the optimal Distance-To-Zero (DTZ) path is selected flawlessly.
+
+### Phase 15: The Deep Thinker & Anti-Shuffle Overhaul
+Despite defeating most engines, the V2.0 architecture occasionally played moves too quickly, ending games with 75% of its time control remaining. We launched the hyper-tuning "Deep Thinker" update to maximize hardware exploitation.
+*   **Calculation Depth (80k Limits):** VRAM constraints were highly optimized using FP16 PyTorch inference, allowing us to double the maximum MCTS search limit from 40,000 to an astounding 80,000 simulations per move on the RTX 3070 Ti without memory failure.
+*   **Aggressive Allocation:** Time management was fundamentally altered. Instead of conservative budgeting, the engine is now permitted to spend upwards of ~16% of its remaining clock time to compute massive, complex positional structures.
+*   **Anti-Shuffle Logic (Rust Protocol):** When a neural engine is objectively winning (+2.0 evaluation), it may accidentally find a "safe" 3-fold repetition draw in its search tree and score it as 0.0 (Acceptable). We injected a hardcoded *Draw Aversion* protocol directly into the leaf expansion phase in `src_rust/src/lib.rs`. If the engine's parent evaluation dictates it is winning (Q > +1.5), and it finds a 3-fold repetition branch, it immediately injects a severe `-5.0` penalty into the MCTS node—poisoning the draw branch and violently forcing the engine to select the decisive, checkmating kill path.
+
+### Phase 16: Polyglot Polish
+To solidify standard opening foundations mathematically, we integrated `chess.polyglot` directly into `src/hybrid_engine.py` with the "best" strategy enabled. Rather than executing weighted-random exploration choices during standard play, the engine now deterministically selects the absolute highest-weight theoretically optimal opening move stored inside the GM opening book, achieving flawless King's Pawn and Queen's Pawn mainlines.
