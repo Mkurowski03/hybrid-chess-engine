@@ -62,6 +62,10 @@ class HybridEngine:
             )
             state_dict = ckpt.get("model_state_dict", ckpt)
             self.model.load_state_dict(state_dict)
+        if self.device.type == "cuda":
+            self.model.half()
+            torch.backends.cudnn.benchmark = True
+            torch.backends.cudnn.deterministic = False
         self.model.to(self.device)
         self.model.eval()
 
@@ -180,16 +184,16 @@ class HybridEngine:
             # Convert list of 3D numpy arrays to a single 4D Torch tensor (B, 18, 8, 8)
             states_np = np.stack(tensors)
             input_cuda = torch.from_numpy(states_np).to(self.device)
+            if self.device.type == "cuda":
+                input_cuda = input_cuda.half()
             
             with torch.inference_mode():
-                if self.device.type == "cuda":
-                    with torch.amp.autocast(device_type="cuda"):
-                        policy, value = self.model(input_cuda)
-                else:
-                    policy, value = self.model(input_cuda)
+                # We have explicitly made model and input .half()
+                policy, value = self.model(input_cuda)
 
-            policy_np = policy.cpu().numpy() # Shape: (B, 4096)
-            value_np = value.cpu().numpy().flatten() # Shape: (B,)
+            # Ensure we convert back to float32 before numpy/Rust transition 
+            policy_np = policy.float().cpu().numpy() # Shape: (B, 4096)
+            value_np = value.float().cpu().numpy().flatten() # Shape: (B,)
             
             # Blend Master Material Weight into Value
             # HybridEngine delegates exact board construction to Rust, but we can approximate material or apply it on Python side if needed.
@@ -244,12 +248,11 @@ class HybridEngine:
             float: Evaluation score from -1.0 to 1.0.
         """
         state = torch.from_numpy(encode_board(board)).unsqueeze(0).to(self.device)
+        if self.device.type == "cuda":
+            state = state.half()
+            
         with torch.inference_mode():
-            if self.device.type == "cuda":
-                with torch.amp.autocast(device_type="cuda"):
-                    _policy, value = self.model(state)
-            else:
-                _policy, value = self.model(state)
+            _policy, value = self.model(state)
         return float(value.item())
 
     @torch.no_grad()
@@ -265,14 +268,13 @@ class HybridEngine:
             list[dict]: List of dictionaries containing top moves and probabilities.
         """
         state = torch.from_numpy(encode_board(board)).unsqueeze(0).to(self.device)
-
         if self.device.type == "cuda":
-            with torch.amp.autocast(device_type="cuda"):
-                policy_logits, _value = self.model(state)
-        else:
+            state = state.half()
+
+        with torch.inference_mode():
             policy_logits, _value = self.model(state)
 
-        logits = policy_logits.squeeze(0).cpu().numpy()
+        logits = policy_logits.squeeze(0).float().cpu().numpy()
 
         legal_moves = []
         for move in board.legal_moves:
