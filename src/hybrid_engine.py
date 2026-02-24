@@ -54,7 +54,8 @@ class HybridEngine:
         """
         self.book_path = book_path
         self.device = torch.device(device if torch.cuda.is_available() else "cpu")
-
+        self.model_cfg = model_cfg
+        
         # ---- model ----
         self.model: ChessNet = build_model(model_cfg)
         if checkpoint_path is not None:
