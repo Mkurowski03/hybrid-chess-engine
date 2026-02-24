@@ -1,0 +1,423 @@
+[
+  {
+    "timestamp": 1771543034.8982346,
+    "game_id": "tD3QWLaZ",
+    "profile": "Pure_NN_No_Material",
+    "opponent": "felipe_bot_53",
+    "opponent_rating": 1216,
+    "outcome": "draw",
+    "status": "aborted",
+    "moves": 0,
+    "config": {
+      "model_path": "checkpoints/baseline/chessnet_epoch9.pt",
+      "simulations": 800,
+      "cpuct": 2.0,
+      "material_weight": 0.0,
+      "discount": 0.9
+    }
+  },
+  {
+    "timestamp": 1771543061.6237855,
+    "game_id": "zRYbCdzH",
+    "profile": "Pure_NN_No_Material",
+    "opponent": "mochi_bot",
+    "opponent_rating": 1808,
+    "outcome": "draw",
+    "status": "aborted",
+    "moves": 1,
+    "config": {
+      "model_path": "checkpoints/baseline/chessnet_epoch9.pt",
+      "simulations": 800,
+      "cpuct": 2.0,
+      "material_weight": 0.0,
+      "discount": 0.9
+    }
+  },
+  {
+    "timestamp": 1771543429.57807,
+    "game_id": "3VKpsCqc",
+    "profile": "Heavy_Material_M8",
+    "opponent": "katzebot",
+    "opponent_rating": 1268,
+    "outcome": "win",
+    "status": "mate",
+    "moves": 51,
+    "config": {
+      "model_path": "checkpoints/baseline/chessnet_epoch9.pt",
+      "simulations": 1200,
+      "cpuct": 1.5,
+      "material_weight": 0.5,
+      "piece_values": {
+        "1": 1,
+        "2": 3,
+        "3": 3,
+        "4": 5,
+        "5": 9
+      },
+      "discount": 0.9
+    }
+  },
+  {
+    "timestamp": 1771543684.285802,
+    "game_id": "2o9oUY9C",
+    "profile": "Heavy_Material_M8",
+    "opponent": "maia5",
+    "opponent_rating": 1542,
+    "outcome": "win",
+    "status": "mate",
+    "moves": 72,
+    "config": {
+      "model_path": "checkpoints/baseline/chessnet_epoch9.pt",
+      "simulations": 1200,
+      "cpuct": 1.5,
+      "material_weight": 0.5,
+      "piece_values": {
+        "1": 1,
+        "2": 3,
+        "3": 3,
+        "4": 5,
+        "5": 9
+      },
+      "discount": 0.9
+    }
+  },
+  {
+    "timestamp": 1771543950.8548088,
+    "game_id": "BuJNEZx7",
+    "profile": "Deep_Search_M8",
+    "opponent": "mochi_bot",
+    "opponent_rating": 1808,
+    "outcome": "loss",
+    "status": "outoftime",
+    "moves": 85,
+    "config": {
+      "model_path": "checkpoints/baseline/chessnet_epoch9.pt",
+      "simulations": 2400,
+      "cpuct": 1.25,
+      "material_weight": 0.2,
+      "discount": 0.9
+    }
+  },
+  {
+    "timestamp": 1771544197.0700493,
+    "game_id": "pnY6tKXr",
+    "profile": "Baseline_M8",
+    "opponent": "mochi_bot",
+    "opponent_rating": 1808,
+    "outcome": "loss",
+    "status": "outoftime",
+    "moves": 155,
+    "config": {
+      "model_path": "checkpoints/baseline/chessnet_epoch9.pt",
+      "simulations": 800,
+      "cpuct": 2.0,
+      "material_weight": 0.2,
+      "discount": 0.9
+    }
+  },
+  {
+    "timestamp": 1771544341.9202101,
+    "game_id": "xhm0rubG",
+    "profile": "Deep_Search_M8",
+    "opponent": "sargon-1ply",
+    "opponent_rating": 1175,
+    "outcome": "loss",
+    "status": "outoftime",
+    "moves": 30,
+    "config": {
+      "model_path": "checkpoints/baseline/chessnet_epoch9.pt",
+      "simulations": 2400,
+      "cpuct": 1.25,
+      "material_weight": 0.2,
+      "discount": 0.9
+    }
+  },
+  {
+    "timestamp": 1771544371.876035,
+    "game_id": "N1FsV4pb",
+    "profile": "Heavy_Material_M8",
+    "opponent": "DavidsGuterBot",
+    "opponent_rating": 1396,
+    "outcome": "loss",
+    "status": "outoftime",
+    "moves": 49,
+    "config": {
+      "model_path": "checkpoints/baseline/chessnet_epoch9.pt",
+      "simulations": 1200,
+      "cpuct": 1.5,
+      "material_weight": 0.5,
+      "piece_values": {
+        "1": 1,
+        "2": 3,
+        "3": 3,
+        "4": 5,
+        "5": 9
+      },
+      "discount": 0.9
+    }
+  },
+  {
+    "timestamp": 1771544520.8256402,
+    "game_id": "vxdKfabS",
+    "profile": "Production_Stable_v1",
+    "opponent": "maia1",
+    "opponent_rating": 1410,
+    "outcome": "win",
+    "status": "mate",
+    "moves": 17,
+    "config": {
+      "model_path": "checkpoints/baseline/chessnet_epoch9.pt",
+      "simulations": 600,
+      "cpuct": 1.25,
+      "material_weight": 0.15,
+      "discount": 0.9,
+      "piece_values": {
+        "1": 1,
+        "2": 3,
+        "3": 3,
+        "4": 5,
+        "5": 9
+      }
+    }
+  },
+  {
+    "timestamp": 1771544597.542061,
+    "game_id": "fju3Xlsu",
+    "profile": "Production_Stable_v1",
+    "opponent": "Jibbby",
+    "opponent_rating": 1700,
+    "outcome": "draw",
+    "status": "draw",
+    "moves": 68,
+    "config": {
+      "model_path": "checkpoints/baseline/chessnet_epoch9.pt",
+      "simulations": 600,
+      "cpuct": 1.25,
+      "material_weight": 0.15,
+      "discount": 0.9,
+      "piece_values": {
+        "1": 1,
+        "2": 3,
+        "3": 3,
+        "4": 5,
+        "5": 9
+      }
+    }
+  },
+  {
+    "timestamp": 1771544672.0635185,
+    "game_id": "84sQLKlc",
+    "profile": "Production_Stable_v1",
+    "opponent": "TuroBot",
+    "opponent_rating": 1357,
+    "outcome": "win",
+    "status": "resign",
+    "moves": 35,
+    "config": {
+      "model_path": "checkpoints/baseline/chessnet_epoch9.pt",
+      "simulations": 600,
+      "cpuct": 1.25,
+      "material_weight": 0.15,
+      "discount": 0.9,
+      "piece_values": {
+        "1": 1,
+        "2": 3,
+        "3": 3,
+        "4": 5,
+        "5": 9
+      }
+    }
+  },
+  {
+    "timestamp": 1771544792.4819343,
+    "game_id": "sl9ckq4e",
+    "profile": "Aggressive_Tactician",
+    "opponent": "TuroBot",
+    "opponent_rating": 1357,
+    "outcome": "win",
+    "status": "mate",
+    "moves": 18,
+    "config": {
+      "model_path": "checkpoints/baseline/chessnet_epoch9.pt",
+      "simulations": 400,
+      "cpuct": 2.0,
+      "material_weight": 0.25,
+      "discount": 0.9,
+      "piece_values": {
+        "1": 1,
+        "2": 3,
+        "3": 3,
+        "4": 5,
+        "5": 9
+      }
+    }
+  },
+  {
+    "timestamp": 1771544983.574678,
+    "game_id": "6z0tvlAA",
+    "profile": "Positional_Deep",
+    "opponent": "TuroBot",
+    "opponent_rating": 1354,
+    "outcome": "win",
+    "status": "mate",
+    "moves": 89,
+    "config": {
+      "model_path": "checkpoints/baseline/chessnet_epoch9.pt",
+      "simulations": 800,
+      "cpuct": 1.0,
+      "material_weight": 0.05,
+      "discount": 0.9,
+      "piece_values": {
+        "1": 1,
+        "2": 3,
+        "3": 3,
+        "4": 5,
+        "5": 9
+      }
+    }
+  },
+  {
+    "timestamp": 1771545182.3617396,
+    "game_id": "K8He6302",
+    "profile": "Aggressive_Tactician",
+    "opponent": "Cimille",
+    "opponent_rating": 1884,
+    "outcome": "loss",
+    "status": "mate",
+    "moves": 55,
+    "config": {
+      "model_path": "checkpoints/baseline/chessnet_epoch9.pt",
+      "simulations": 400,
+      "cpuct": 2.0,
+      "material_weight": 0.25,
+      "discount": 0.9,
+      "piece_values": {
+        "1": 1,
+        "2": 3,
+        "3": 3,
+        "4": 5,
+        "5": 9
+      }
+    }
+  },
+  {
+    "timestamp": 1771545497.6129727,
+    "game_id": "mVfy79QJ",
+    "profile": "Production_Stable_v1",
+    "opponent": "Cimille",
+    "opponent_rating": 1884,
+    "outcome": "loss",
+    "status": "outoftime",
+    "moves": 26,
+    "config": {
+      "model_path": "checkpoints/baseline/chessnet_epoch9.pt",
+      "simulations": 600,
+      "cpuct": 1.25,
+      "material_weight": 0.15,
+      "discount": 0.9,
+      "piece_values": {
+        "1": 1,
+        "2": 3,
+        "3": 3,
+        "4": 5,
+        "5": 9
+      }
+    }
+  },
+  {
+    "timestamp": 1771545726.7644572,
+    "game_id": "fbaebQFO",
+    "profile": "Positional_Deep",
+    "opponent": "Cimille",
+    "opponent_rating": 1884,
+    "outcome": "loss",
+    "status": "mate",
+    "moves": 113,
+    "config": {
+      "model_path": "checkpoints/baseline/chessnet_epoch9.pt",
+      "simulations": 800,
+      "cpuct": 1.0,
+      "material_weight": 0.05,
+      "discount": 0.9,
+      "piece_values": {
+        "1": 1,
+        "2": 3,
+        "3": 3,
+        "4": 5,
+        "5": 9
+      }
+    }
+  },
+  {
+    "timestamp": 1771546153.3638644,
+    "game_id": "BiPG3hKj",
+    "profile": "Endgame_Grinder",
+    "opponent": "Cimille",
+    "opponent_rating": 1885,
+    "outcome": "loss",
+    "status": "outoftime",
+    "moves": 24,
+    "config": {
+      "model_path": "checkpoints/baseline/chessnet_epoch9.pt",
+      "simulations": 600,
+      "cpuct": 1.5,
+      "material_weight": 0.15,
+      "discount": 0.85,
+      "piece_values": {
+        "1": 1,
+        "2": 3,
+        "3": 3,
+        "4": 5,
+        "5": 9
+      }
+    }
+  },
+  {
+    "timestamp": 1771546264.4395125,
+    "game_id": "ly8MThc5",
+    "profile": "Production_Stable_v1",
+    "opponent": "Cimille",
+    "opponent_rating": 1887,
+    "outcome": "loss",
+    "status": "outoftime",
+    "moves": 5,
+    "config": {
+      "model_path": "checkpoints/baseline/chessnet_epoch9.pt",
+      "simulations": 600,
+      "cpuct": 1.25,
+      "material_weight": 0.15,
+      "discount": 0.9,
+      "piece_values": {
+        "1": 1,
+        "2": 3,
+        "3": 3,
+        "4": 5,
+        "5": 9
+      }
+    }
+  },
+  {
+    "timestamp": 1771546348.5891707,
+    "game_id": "FmrhOAsl",
+    "profile": "Production_Stable_v1",
+    "opponent": "turkjs",
+    "opponent_rating": 1835,
+    "outcome": "draw",
+    "status": "draw",
+    "moves": 91,
+    "config": {
+      "model_path": "checkpoints/baseline/chessnet_epoch9.pt",
+      "simulations": 600,
+      "cpuct": 1.25,
+      "material_weight": 0.15,
+      "discount": 0.9,
+      "piece_values": {
+        "1": 1,
+        "2": 3,
+        "3": 3,
+        "4": 5,
+        "5": 9
+      }
+    }
+  }
+]

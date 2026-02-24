@@ -1,0 +1,46 @@
+# Python Artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Environments
+venv/
+env/
+.env
+.venv
+
+# Large Data & Models
+*.pgn
+*.h5
+*.hdf5
+*.pt
+*.bin
+*.7z
+*.zst
+data/
+
+# Logs & Temp
+*.log
+*.txt
+temp/
+*.tmp
+logs/
+.system_generated/
+*.prof
+
+# Binaries & Executables
+stockfish.exe
+cutechess-cli.exe
+*.exe
+*.dll
+cutechess-1.4.0-win64/
+
+# IDE & OS Settings
+.vscode/
+.idea/
+.DS_Store
+*.swp
+
+# SQLite
+*.sqlite3

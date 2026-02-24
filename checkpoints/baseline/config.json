@@ -1,0 +1,26 @@
+{
+  "model": {
+    "in_channels": 18,
+    "num_filters": 128,
+    "num_residual_blocks": 10,
+    "policy_output_dim": 4096,
+    "value_hidden_dim": 256
+  },
+  "train": {
+    "batch_size": 1024,
+    "num_epochs": 10,
+    "learning_rate": 0.002,
+    "weight_decay": 0.0001,
+    "val_split": 0.1,
+    "patience": 5,
+    "save_best": true,
+    "dataloader_workers": 4,
+    "log_every_n_steps": 100,
+    "checkpoint_dir": "checkpoints",
+    "wandb_project": "chessnet-3070",
+    "compile_model": false,
+    "policy_loss_weight": 1.0,
+    "value_loss_weight": 1.0,
+    "use_wandb": false
+  }
+}

@@ -1,0 +1,78 @@
+[
+    {
+        "name": "Production_Stable_v1",
+        "description": "Balanced config. Good speed (600 sims) and strong mating incentive (0.90 discount).",
+        "active": true,
+        "config": {
+            "model_path": "checkpoints/baseline/chessnet_epoch9.pt",
+            "simulations": 600,
+            "cpuct": 1.25,
+            "material_weight": 0.15,
+            "discount": 0.90,
+            "piece_values": {
+                "1": 1,
+                "2": 3,
+                "3": 3,
+                "4": 5,
+                "5": 9
+            }
+        }
+    },
+    {
+        "name": "Aggressive_Tactician",
+        "description": "Higher exploration (cpuct 2.0) to find hidden tactics. More material safety (0.25).",
+        "active": true,
+        "config": {
+            "model_path": "checkpoints/baseline/chessnet_epoch9.pt",
+            "simulations": 400,
+            "cpuct": 2.0,
+            "material_weight": 0.25,
+            "discount": 0.90,
+            "piece_values": {
+                "1": 1,
+                "2": 3,
+                "3": 3,
+                "4": 5,
+                "5": 9
+            }
+        }
+    },
+    {
+        "name": "Positional_Deep",
+        "description": "Trusts the neural network heavily (low material weight). Narrow search (cpuct 1.0) but deeper.",
+        "active": true,
+        "config": {
+            "model_path": "checkpoints/baseline/chessnet_epoch9.pt",
+            "simulations": 800,
+            "cpuct": 1.0,
+            "material_weight": 0.05,
+            "discount": 0.90,
+            "piece_values": {
+                "1": 1,
+                "2": 3,
+                "3": 3,
+                "4": 5,
+                "5": 9
+            }
+        }
+    },
+    {
+        "name": "Endgame_Grinder",
+        "description": "Extreme mating incentive (0.85 discount) to fix looping issues. Balanced search.",
+        "active": true,
+        "config": {
+            "model_path": "checkpoints/baseline/chessnet_epoch9.pt",
+            "simulations": 600,
+            "cpuct": 1.5,
+            "material_weight": 0.15,
+            "discount": 0.85,
+            "piece_values": {
+                "1": 1,
+                "2": 3,
+                "3": 3,
+                "4": 5,
+                "5": 9
+            }
+        }
+    }
+]
