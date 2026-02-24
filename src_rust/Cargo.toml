@@ -8,7 +8,8 @@ name = "chess_engine_core"
 crate-type = ["cdylib"]
 
 [dependencies]
-pyo3 = { version = "0.22", features = ["extension-module"] }
-numpy = "0.22"
-shakmaty = "0.26"
+pyo3 = { version = "0.19", features = ["extension-module"] }
+numpy = "0.19"
+shakmaty = "=0.25.0"
+shakmaty-syzygy = "=0.23.0"
 ndarray = "0.15"

@@ -8,6 +8,7 @@ from typing import Optional, List, Dict, Any
 
 import chess
 import chess.polyglot
+import chess.syzygy
 import numpy as np
 import torch
 
@@ -68,6 +69,17 @@ class HybridEngine:
             torch.backends.cudnn.deterministic = False
         self.model.to(self.device)
         self.model.eval()
+        
+        # ---- syzygy ----
+        self.tablebase = None
+        if model_cfg and model_cfg.syzygy_path:
+            tb_path = Path(model_cfg.syzygy_path)
+            if tb_path.exists() and any(tb_path.iterdir()):
+                try:
+                    self.tablebase = chess.syzygy.open_tablebase(str(tb_path))
+                    logging.info(f"Syzygy tablebase loaded from {tb_path}")
+                except Exception as e:
+                    logging.warning(f"Could not load Syzygy: {e}")
 
     def select_move(
         self, 
@@ -123,6 +135,55 @@ class HybridEngine:
             except Exception as e:
                 logging.warning(f"Error reading opening book: {e}")
         # --------------------------------------------
+        
+        # --- SYZYGY ENDGAME ROOT PROBING ---
+        if self.tablebase is not None:
+            piece_count = len(board.piece_map())
+            if piece_count <= 5: # Assuming 5-piece tablebases are populated
+                try:
+                    # DTZ (Distance To Zero) gives the optimal move to win/draw
+                    wdl = self.tablebase.probe_wdl(board)
+                    if wdl is not None:
+                        # Find the best move according to DTZ, which preserves perfect play
+                        best_move = None
+                        best_dtz = None
+                        
+                        # We want the lowest absolute DTZ for winning, highest for losing etc.
+                        # python-chess has a convenient probe_dtz
+                        
+                        # Just grab the first move that maintains the WDL or optimal DTZ
+                        for m in board.legal_moves:
+                            board.push(m)
+                            # After our move, it's opponents turn, so DTZ flips
+                            try:
+                                dtz = self.tablebase.probe_dtz(board)
+                                # WDL flips too (from opponents perspective)
+                                reply_wdl = self.tablebase.probe_wdl(board)
+                                board.pop()
+                                
+                                # Simplified logic: If we are winning (wdl > 0), we want the reply_wdl to be < 0 for opponent
+                                if wdl > 0 and reply_wdl < 0:
+                                    if best_dtz is None or dtz > best_dtz: # Negative DTZ is worse for opponent
+                                        best_dtz = dtz
+                                        best_move = m
+                                elif wdl == 0 and reply_wdl == 0:
+                                    best_move = m
+                                elif wdl < 0 and reply_wdl > 0:
+                                    # We are losing. Maximize DTZ to delay mate
+                                    if best_dtz is None or dtz > best_dtz:
+                                        best_dtz = dtz
+                                        best_move = m
+                            except:
+                                board.pop()
+                                
+                        if best_move:
+                            logging.info(f"[SYZYGY] Perfect endgame move found: {best_move.uci()} (WDL: {wdl})")
+                            return best_move
+                except chess.syzygy.MissingTableError:
+                    pass
+                except Exception as e:
+                    logging.warning(f"Syzygy probing error: {e}")
+        # --------------------------------------------
 
         legal = list(board.legal_moves)
         if len(legal) == 1:
@@ -158,7 +219,13 @@ class HybridEngine:
 
         # Initialize Rust MCTS Tree
         fen = board.fen()
-        rust_mcts = chess_engine_core.RustMCTS(fen, cpuct, discount)
+        
+        # Pass syzygy path if available
+        tb_path_str = None
+        if self.tablebase is not None and model_cfg and model_cfg.syzygy_path:
+            tb_path_str = model_cfg.syzygy_path
+            
+        rust_mcts = chess_engine_core.RustMCTS(fen, cpuct, discount, tb_path_str)
 
         current_sims = 0
         
@@ -194,6 +261,18 @@ class HybridEngine:
             # Ensure we convert back to float32 before numpy/Rust transition 
             policy_np = policy.float().cpu().numpy() # Shape: (B, 4096)
             value_np = value.float().cpu().numpy().flatten() # Shape: (B,)
+            
+            # --- SYZYGY MCTS LEAF OVERRIDE ---
+            if self.tablebase is not None:
+                for idx, node_id in enumerate(node_ids):
+                    # We need the FEN or board to probe. 
+                    # Optimization Note: Reconstructing the board from Rust node is expensive in Python.
+                    # Since this runs inside the hot loop, a pure Python override is too slow (re-parsing FENs).
+                    # For phase 1, we rely solely on Root Probing (implemented above), which already catches
+                    # 5-piece endgames at the start of the turn instantly. 
+                    # To do leaf-probing efficiently, it MUST be implemented in Rust via shakmaty-syzygy.
+                    pass
+            # ---------------------------------
             
             # Blend Master Material Weight into Value
             # HybridEngine delegates exact board construction to Rust, but we can approximate material or apply it on Python side if needed.

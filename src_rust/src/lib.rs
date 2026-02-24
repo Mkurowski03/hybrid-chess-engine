@@ -2,6 +2,7 @@ use pyo3::prelude::*;
 use pyo3::exceptions::PyValueError;
 use numpy::{PyArray3, IntoPyArray};
 use shakmaty::{fen::Fen, CastlingMode, Chess, Color, Position, Role, MoveList};
+use shakmaty_syzygy::Tablebase;
 use std::str::FromStr;
 use std::hash::{Hash, Hasher};
 use std::collections::hash_map::DefaultHasher;
@@ -56,7 +57,7 @@ impl Node {
     }
 }
 
-pub fn encode_rust_board<'py>(pos: &Chess, py: Python<'py>) -> PyResult<Bound<'py, PyArray3<f32>>> {
+pub fn encode_rust_board<'py>(pos: &Chess, py: Python<'py>) -> PyResult<&'py PyArray3<f32>> {
     let mut planes = ndarray::Array3::<f32>::zeros((18, 8, 8));
     
     let us = pos.turn();
@@ -123,8 +124,8 @@ pub fn encode_rust_board<'py>(pos: &Chess, py: Python<'py>) -> PyResult<Bound<'p
     }
 
     // SAFETY: Translates the Rust `ndarray` to a Python numpy object dynamically.
-    // `into_pyarray_bound` executes a zero-copy transfer of the heap-allocated Rust array into Python space.
-    Ok(planes.into_pyarray_bound(py))
+    // `into_pyarray` executes a zero-copy transfer of the heap-allocated Rust array into Python space.
+    Ok(planes.into_pyarray(py))
 }
 
 #[pyclass]
@@ -164,7 +165,7 @@ impl RustBoard {
         }
     }
 
-    pub fn encode<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray3<f32>>> {
+    pub fn encode<'py>(&self, py: Python<'py>) -> PyResult<&'py PyArray3<f32>> {
         encode_rust_board(&self.pos, py)
     }
 }
@@ -175,12 +176,14 @@ pub struct RustMCTS {
     root: usize,
     cpuct: f32,
     discount: f32,
+    tablebase: Option<Tablebase<Chess>>,
 }
 
 #[pymethods]
 impl RustMCTS {
     #[new]
-    pub fn new(fen: &str, cpuct: Option<f32>, discount: Option<f32>) -> PyResult<Self> {
+    #[pyo3(signature = (fen, cpuct=None, discount=None, syzygy_path=None))]
+    pub fn new(fen: &str, cpuct: Option<f32>, discount: Option<f32>, syzygy_path: Option<&str>) -> PyResult<Self> {
         let setup = Fen::from_str(fen)
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("Invalid FEN: {}", e)))?;
         let pos = setup.into_position(CastlingMode::Standard)
@@ -188,15 +191,24 @@ impl RustMCTS {
         
         let root_node = Node::new(pos, None, None, 1.0);
         
+        let mut tablebase = None;
+        if let Some(path) = syzygy_path {
+            let mut tbs = Tablebase::new();
+            if tbs.add_directory(path).is_ok() {
+                tablebase = Some(tbs);
+            }
+        }
+        
         Ok(RustMCTS {
             nodes: vec![root_node],
             root: 0,
             cpuct: cpuct.unwrap_or(1.25),
             discount: discount.unwrap_or(0.99),
+            tablebase,
         })
     }
 
-    pub fn select_leaves<'py>(&mut self, py: Python<'py>, batch_size: usize) -> PyResult<(Vec<Bound<'py, PyArray3<f32>>>, Vec<usize>)> {
+    pub fn select_leaves<'py>(&mut self, py: Python<'py>, batch_size: usize) -> PyResult<(Vec<&'py PyArray3<f32>>, Vec<usize>)> {
         let mut leaves = Vec::new();
         let mut tensors = Vec::new();
 
@@ -245,6 +257,48 @@ impl RustMCTS {
                     self.nodes[curr].terminal = true;
                 } else if let Some(outcome) = self.nodes[curr].pos.outcome() {
                     self.nodes[curr].terminal = true;
+                } else {
+                    // Check Syzygy if piece count <= 5
+                    let piece_count = self.nodes[curr].pos.board().occupied().count();
+                    if piece_count <= 5 {
+                        if let Some(ref mut tbs) = self.tablebase {
+                            // Check tablebase WDL
+                            if let Ok(wdl) = tbs.probe_wdl(&self.nodes[curr].pos) {
+                                // AmbiguousWdl -> Float mappings (Shakmaty 0.23)
+                                // We extract the underlying base WDL to evaluate the draw/loss bounds
+                                let is_win = wdl == shakmaty_syzygy::Wdl::Win.into();
+                                let is_loss = wdl == shakmaty_syzygy::Wdl::Loss.into();
+                                
+                                let tb_val = if is_win {
+                                    1.0
+                                } else if is_loss {
+                                    -1.0
+                                } else {
+                                    0.0
+                                };
+                                
+                                // Override this node as terminal with the syzygy evaluation
+                                self.nodes[curr].terminal = true;
+                                
+                                // Backpropagate immediately
+                                let mut back_curr = curr;
+                                let mut current_val = tb_val;
+                                self.nodes[back_curr].visits += 1;
+                                self.nodes[back_curr].value_sum += current_val;
+                                
+                                let mut path_depth = 0;
+                                while let Some(p) = self.nodes[back_curr].parent {
+                                    path_depth += 1;
+                                    current_val = -current_val;
+                                    let discounted = current_val * self.discount.powi(path_depth);
+                                    self.nodes[p].visits += 1;
+                                    self.nodes[p].value_sum += discounted;
+                                    back_curr = p;
+                                }
+                                continue;
+                            }
+                        }
+                    }
                 }
             }
 
@@ -366,7 +420,7 @@ impl RustMCTS {
 }
 
 #[pymodule]
-fn chess_engine_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn chess_engine_core(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
     m.add_class::<RustBoard>()?;
     m.add_class::<RustMCTS>()?;
     Ok(())

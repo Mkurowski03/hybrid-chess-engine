@@ -20,6 +20,7 @@ class ModelConfig:
     num_residual_blocks: int = 10     # depth of the tower
     policy_output_dim: int = 4096     # 64 × 64  (from-square, to-square)
     value_hidden_dim: int = 256       # FC layer in the value head
+    syzygy_path: str = "tablebases/"  # Default Syzygy directory
 
 
 # ── Data / ETL ─────────────────────────────────────────────────────────
