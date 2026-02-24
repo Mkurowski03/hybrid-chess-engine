@@ -27,7 +27,7 @@ class ModelConfig:
 class DataConfig:
     data_dir: Path = Path("data")
     train_file: str = "train.h5"
-    min_elo: int = 1800               # both players must be ≥ this
+    min_elo: int = 2200               # both players must be ≥ this
     min_time: int = 180               # base time-control in seconds
     max_positions_per_game: int = 10  # random sample per game
     opening_skip_prob: float = 0.5    # P(skip) for first 10 moves
