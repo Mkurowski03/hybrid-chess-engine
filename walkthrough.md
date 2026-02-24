@@ -298,3 +298,12 @@ To certify the completion of the V2.0 Hybrid Rust Engine, we challenged the offi
 
 **Conclusion**
 The project has successfully completed its grueling evolution cycle. What began as a sluggish Python script with tactical blindness playing at a ~1500 ELO level has been violently reforged. Through aggressive hyper-parameter tuning, custom imitation-learning datasets, strict neural evaluation blending, and an elite-tier PyO3 Rust bridge executing 40,000 parallel simulations via GPU tensor batching—ChessNet-3070 V2.0 formally graduates as a Master-level engine.
+
+### Phase 14: The Syzygy Integration (God-Mode Endgames)
+Even with Rust MCTS and 40,000 simulations, deep endgames (like K+R vs K) could occasionally suffer from the "horizon effect" or MCTS discount dragging out the mate. To achieve "God-Mode" perfect play, we directly embedded **5-piece Syzygy Tablebases (WDL/DTZ)** into the core engine logic.
+
+**The Challenge:**
+Integrating `shakmaty-syzygy` into the Rust MCTS tree required resolving complex dependency trees and type traits across different crate versions (PyO3, Numpy, and Shakmaty). It also required injecting the tablebase probe into the leaf expansion loop inside Rust, bypassing the neural network entirely when 5 or fewer pieces remain on the board.
+
+**The Result:**
+Zero-latency probing straight from the Rust loop. K+R vs K mates are solved instantly with true mathematical Win/Draw/Loss certainty, guaranteeing the engine plays undeniably perfect chess in simplified endgames. MCTS is bypassed for these exact positions, and the optimal Distance-To-Zero (DTZ) path is selected flawlessly.

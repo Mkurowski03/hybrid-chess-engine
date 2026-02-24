@@ -25,6 +25,7 @@ By offloading the massive Monte Carlo Tree Search (MCTS) graph and mathematics t
 * 🔄 **Zero-Copy Bridge:** 18-channel board states are encoded directly into Python memory space, eliminating data-transfer bottlenecks.
 * 🛡️ **Panic Mode:** Dynamic time-management ensures the engine never flags, scaling down simulations when the clock is low.
 * ⚔️ **Mate Guard:** Instant 1-ply forced-mate solver cures "promotion blindness".
+* 🧩 **Endgame Excellence:** Integrated 5-piece Syzygy Tablebases (WDL/DTZ) directly into the Rust MCTS core. The engine plays mathematically perfect chess when 5 or fewer pieces remain.
 
 ### 📊 Data & Training
 * **Dataset:** Trained on **24 Million+ Positions** extracted from the **Lumbras Gigabase** (3.7M high-quality games, Elo ≥ 2200).
