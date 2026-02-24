@@ -253,7 +253,35 @@ impl RustMCTS {
             }
             
             if !self.nodes[curr].terminal {
-                if rep_count >= 3 || self.nodes[curr].pos.halfmoves() >= 100 || self.nodes[curr].pos.is_insufficient_material() {
+                if rep_count >= 3 {
+                    self.nodes[curr].terminal = true;
+                    // Draw Aversion: If the parent node evaluates as "winning" (Q > 0.1, approx +1.5 score), 
+                    // poison this repetition line heavily so the engine finds another winning path.
+                    let parent_q = if let Some(p) = self.nodes[curr].parent {
+                        if self.nodes[p].visits > 0 { self.nodes[p].value_sum / self.nodes[p].visits as f32 } else { 0.0 }
+                    } else {
+                        0.0
+                    };
+                    
+                    let penalty = if parent_q > 0.1 { -5.0 } else { 0.0 };
+                    
+                    // Backpropagate the repetition (0.0 or -5.0 penalty)
+                    let mut back_curr = curr;
+                    let mut current_val = penalty;
+                    self.nodes[back_curr].visits += 1;
+                    self.nodes[back_curr].value_sum += current_val;
+                    
+                    let mut path_depth = 0;
+                    while let Some(p) = self.nodes[back_curr].parent {
+                        path_depth += 1;
+                        current_val = -current_val;
+                        let discounted = current_val * self.discount.powi(path_depth);
+                        self.nodes[p].visits += 1;
+                        self.nodes[p].value_sum += discounted;
+                        back_curr = p;
+                    }
+                    continue;
+                } else if self.nodes[curr].pos.halfmoves() >= 100 || self.nodes[curr].pos.is_insufficient_material() {
                     self.nodes[curr].terminal = true;
                 } else if let Some(outcome) = self.nodes[curr].pos.outcome() {
                     self.nodes[curr].terminal = true;

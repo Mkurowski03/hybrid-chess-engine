@@ -93,7 +93,8 @@ class HybridEngine:
         wtime: Optional[int] = None,
         btime: Optional[int] = None,
         winc: int = 0,
-        binc: int = 0
+        binc: int = 0,
+        book_strategy: str = "best"
     ) -> chess.Move:
         """Select a move using Rust MCTS + PyTorch Network.
 
@@ -127,10 +128,19 @@ class HybridEngine:
         if self.book_path and Path(self.book_path).exists():
             try:
                 with chess.polyglot.open_reader(self.book_path) as reader:
-                    entry = reader.weighted_choice(board)
-                    if entry:
-                        logging.info(f"[BOOK] Found move {entry.move.uci()} (weight: {entry.weight})")
-                        return entry.move
+                    if book_strategy == "best":
+                        best_entry = None
+                        for entry in reader.find_all(board):
+                            if best_entry is None or entry.weight > best_entry.weight:
+                                best_entry = entry
+                        if best_entry:
+                            logging.info(f"[BOOK] Found best move {best_entry.move.uci()} (weight: {best_entry.weight})")
+                            return best_entry.move
+                    else:
+                        entry = reader.weighted_choice(board)
+                        if entry:
+                            logging.info(f"[BOOK] Found move {entry.move.uci()} (weight: {entry.weight})")
+                            return entry.move
             except IndexError:
                 pass
             except Exception as e:
@@ -200,7 +210,8 @@ class HybridEngine:
         my_inc = winc if board.turn == chess.WHITE else binc
 
         if my_time is not None:
-            alloc_time_ms = (my_time / 20.0) + (my_inc * 0.75)
+            # Deep Thinker: Spend ~16.6% of remaining time per move (more aggressive)
+            alloc_time_ms = (my_time / 6.0) + (my_inc * 0.75)
             safe_time_ms = my_time - 1000  # Leave absolute 1 second buffer
             if safe_time_ms < 100:
                 safe_time_ms = 100 # absolute minimum allowed to think
@@ -209,8 +220,9 @@ class HybridEngine:
             ESTIMATED_NPS = 6500
             max_possible_sims = int((alloc_time_ms / 1000.0) * ESTIMATED_NPS)
             
-            # If we literally have less than 1 second allocated and very low buffer, reduce drastically
-            if my_time < 5000:
+            # Deep Thinker: Raised panic threshold to 15 seconds. Below that, cap to 5000 sims or lower
+            if my_time < 15000:
+                max_possible_sims = min(max_possible_sims, 5000)
                 max_possible_sims = min(max_possible_sims, int((safe_time_ms / 1000.0) * ESTIMATED_NPS))
             
             sims = max(batch_size, min(sims, max_possible_sims))

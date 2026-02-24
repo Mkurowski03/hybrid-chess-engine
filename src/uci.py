@@ -23,7 +23,7 @@ def main() -> None:
     """Run the UCI protocol."""
     parser = argparse.ArgumentParser(description="ChessNet-3070 UCI Engine")
     parser.add_argument("--model", type=str, default="checkpoints/baseline/chessnet_epoch9.pt", help="Path to checkpoint")
-    parser.add_argument("--sims", type=int, default=600, help="Number of MCTS simulations")
+    parser.add_argument("--sims", type=int, default=80000, help="Number of MCTS simulations")
     parser.add_argument("--cpuct", type=float, default=1.25, help="PUCT exploration constant")
     parser.add_argument("--discount", type=float, default=0.90, help="Checkmate discount factor")
     parser.add_argument("--material", type=float, default=0.15, help="Material weight")

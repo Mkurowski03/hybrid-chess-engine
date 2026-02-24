@@ -95,7 +95,7 @@ def api_move() -> tuple[Response, int] | Response:
         })
 
     depth = data.get("depth")
-    sims = data.get("sims", 2200)
+    sims = data.get("sims", 80000)
     cpuct = data.get("cpuct", 1.25)
     material = data.get("material", 0.15)
     discount = data.get("discount", 0.99)
@@ -134,7 +134,7 @@ def api_top_moves() -> tuple[Response, int] | Response:
     data = request.get_json()
     fen = data.get("fen")
     n = data.get("n", 5)
-    sims = data.get("sims", 600)
+    sims = data.get("sims", 80000)
     cpuct = data.get("cpuct", 1.25)
     material = data.get("material", 0.15)
     discount = data.get("discount", 0.99)
