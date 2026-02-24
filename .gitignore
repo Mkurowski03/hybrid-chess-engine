@@ -37,6 +37,7 @@ stockfish.exe
 cutechess-cli.exe
 *.exe
 *.dll
+*.bat
 cutechess-1.4.0-win64/
 
 # IDE & OS Settings
