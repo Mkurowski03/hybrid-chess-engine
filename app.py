@@ -19,16 +19,15 @@ import chess
 from flask import Flask, jsonify, request, send_from_directory
 from flask_cors import CORS
 
-from src.engine import ChessEngine
+from src.hybrid_engine import HybridEngine
 from config import ModelConfig
 
 app = Flask(__name__, static_folder="static")
 CORS(app)
 
 # Load Engine
-CHECKPOINT_PATH = "checkpoints/baseline/best.pt"
-SYZYGY_PATH = os.getenv("SYZYGY_PATH")
-engine = ChessEngine(CHECKPOINT_PATH, syzygy_path=SYZYGY_PATH)
+CHECKPOINT_PATH = "checkpoints/baseline/chessnet_epoch9.pt"
+engine = HybridEngine(CHECKPOINT_PATH)
 
 
 def _find_checkpoints() -> list[dict]:
@@ -86,18 +85,25 @@ def api_move():
         })
 
     depth = data.get("depth")
-    sims = data.get("sims", 600)
+    sims = data.get("sims", 2200)
     cpuct = data.get("cpuct", 1.25)
     material = data.get("material", 0.15)
     discount = data.get("discount", 0.99)
     
+    wtime = data.get("wtime", 300000) # Give it 5 virtual minutes to think
+    btime = data.get("btime", 300000)
+    
     move = engine.select_move(
         board, 
-        depth=depth, 
         sims=sims, 
         cpuct=cpuct, 
         material_weight=material, 
-        discount=discount
+        discount=discount,
+        batch_size=64,
+        wtime=wtime,
+        btime=btime,
+        winc=2000,
+        binc=2000
     )
     evaluation = engine.evaluate(board)
 
@@ -191,7 +197,7 @@ def api_load_checkpoint():
         if "num_residual_blocks" in model_section:
             model_cfg.num_residual_blocks = model_section["num_residual_blocks"]
 
-    engine = ChessEngine(checkpoint_path=path, model_cfg=model_cfg)
+    engine = HybridEngine(checkpoint_path=path, model_cfg=model_cfg)
     return jsonify({"status": "loaded", "path": path})
 
 
@@ -227,10 +233,10 @@ def main():
                 model_cfg.num_filters = model_section["num_filters"]
             if "num_residual_blocks" in model_section:
                 model_cfg.num_residual_blocks = model_section["num_residual_blocks"]
-        engine = ChessEngine(checkpoint_path=checkpoint, model_cfg=model_cfg)
+        engine = HybridEngine(checkpoint_path=checkpoint, model_cfg=model_cfg)
         print(f"  [+] Model loaded: {checkpoint}")
     else:
-        engine = ChessEngine(checkpoint_path=None)
+        engine = HybridEngine(checkpoint_path=None)
         print("  [!] No checkpoint found — using random weights!")
 
     import inspect

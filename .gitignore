@@ -15,6 +15,7 @@ env/
 *.h5
 *.hdf5
 *.pt
+!checkpoints/baseline/chessnet_epoch9.pt
 *.bin
 *.7z
 *.zst
@@ -22,6 +23,7 @@ data/
 
 # Logs & Temp
 *.log
+!live_engine.log
 *.txt
 temp/
 *.tmp
@@ -44,3 +46,7 @@ cutechess-1.4.0-win64/
 
 # SQLite
 *.sqlite3
+
+# Rust
+src_rust/target/
+Cargo.lock

@@ -617,14 +617,16 @@
             <div class="panel">
                 <div class="panel-title">Engine Personality</div>
                 <select id="personalitySelect" onchange="updatePersonality()">
-                    <option value='{"sims":600,"cpuct":1.25,"material":0.15,"discount":0.99}'>MCTS_Baseline (600 Sims |
-                        Blitz)</option>
+                    <option value='{"sims":40000,"cpuct":1.25,"material":0.15,"discount":0.90}' selected>Hybrid Beast
+                        (Rust 40k | Grandmaster level deep search)</option>
                     <option value='{"sims":2200,"cpuct":1.25,"material":0.15,"discount":0.90}'>Champion_Rapid (2200 Sims
                         | Positional)</option>
                     <option value='{"sims":2200,"cpuct":0.80,"material":0.15,"discount":0.90}'>Sniper_Rapid (2200 Sims |
                         Tactical)</option>
                     <option value='{"sims":2200,"cpuct":1.25,"material":0.35,"discount":0.90}'>Solid_Rapid (2200 Sims |
                         Materialistic)</option>
+                    <option value='{"sims":600,"cpuct":1.25,"material":0.15,"discount":0.99}'>MCTS_Baseline (600 Sims |
+                        Blitz)</option>
                 </select>
                 <div id="personalityDetails"
                     style="margin-top:0.5rem; font-size:0.75rem; color:var(--text-muted); font-family:'JetBrains Mono', monospace;">

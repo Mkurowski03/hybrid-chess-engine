@@ -1,0 +1,13 @@
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "chess-engine-core"
+version = "0.1.0"
+description = "High-performance Rust chess logic bindings"
+requires-python = ">=3.8"
+
+[tool.maturin]
+features = ["pyo3/extension-module"]
+manifest-path = "src_rust/Cargo.toml"

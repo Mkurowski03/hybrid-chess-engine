@@ -1,0 +1,14 @@
+[package]
+name = "chess_engine_core"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "chess_engine_core"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.22", features = ["extension-module"] }
+numpy = "0.22"
+shakmaty = "0.26"
+ndarray = "0.15"

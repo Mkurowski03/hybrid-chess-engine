@@ -35,32 +35,28 @@ def main():
     print(f"Found cutechess: {cutechess_path}")
 
     # Define our engine configurations
-    champion_bat = os.path.join(root_dir, "run_champion_rapid.bat")
-    sniper_bat = os.path.join(root_dir, "run_sniper_rapid.bat")
-    solid_bat = os.path.join(root_dir, "run_solid_rapid.bat")
+    hybrid_bat = os.path.join(root_dir, "run_hybrid_beast.bat")
     
     engines = [
-        f'-engine name="Champion_Rapid" cmd="{champion_bat}" proto=uci',
-        f'-engine name="Sniper_Rapid" cmd="{sniper_bat}" proto=uci',
-        f'-engine name="Solid_Rapid" cmd="{solid_bat}" proto=uci'
+        f'-engine name="Hybrid_Beast_40k" cmd="{hybrid_bat}" proto=uci',
     ]
 
     # Define Stockfish opponent ladder
     opponents = [
-        f'-engine name="Stockfish-1700" cmd="{stockfish_path}" proto=uci option.UCI_LimitStrength=true option.UCI_Elo=1700',
-        f'-engine name="Stockfish-1900" cmd="{stockfish_path}" proto=uci option.UCI_LimitStrength=true option.UCI_Elo=1900',
-        f'-engine name="Stockfish-2100" cmd="{stockfish_path}" proto=uci option.UCI_LimitStrength=true option.UCI_Elo=2100'
+        f'-engine name="Stockfish-2100" cmd="{stockfish_path}" proto=uci option.UCI_LimitStrength=true option.UCI_Elo=2100',
+        f'-engine name="Stockfish-2300" cmd="{stockfish_path}" proto=uci option.UCI_LimitStrength=true option.UCI_Elo=2300',
+        f'-engine name="Stockfish-2500" cmd="{stockfish_path}" proto=uci option.UCI_LimitStrength=true option.UCI_Elo=2500'
     ]
 
     # Tournament settings (Rapid time control)
     time_control = "-each tc=180+2.0" # 3 mins + 2.0s increment
-    concurrency = "-concurrency 4"
-    rounds = "-rounds 3" # 3 matches with -repeat gives 6 games per pairing
+    concurrency = "-concurrency 3"
+    rounds = "-rounds 2" # 2 matches with -repeat gives 4 games per pairing
     
     # cutechess-cli tournament flags:
     # -recover: restart crashed engines
     # -repeat: play each opening twice (once as white, once as black)
-    flags = "-tournament round-robin -recover -repeat -pgnout rapid_results.pgn"
+    flags = "-tournament round-robin -recover -repeat -pgnout hybrid_beast_results.pgn"
 
     # Build the command string
     cmd_parts = [cutechess_path] + time_control.split() + concurrency.split() + rounds.split()
