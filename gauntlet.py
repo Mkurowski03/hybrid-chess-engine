@@ -1,9 +1,22 @@
+import logging
 import os
-import sys
 import subprocess
+import sys
 from pathlib import Path
+from typing import List, Optional
 
-def find_executable(name, search_dirs):
+logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
+
+def find_executable(name: str, search_dirs: List[str]) -> Optional[str]:
+    """Find the path to an executable within the specified search directories.
+
+    Args:
+        name (str): Name of the executable.
+        search_dirs (List[str]): Base directories to search in.
+
+    Returns:
+        Optional[str]: Absolute path to the executable or None.
+    """
     for d in search_dirs:
         path = os.path.join(d, name)
         if os.path.exists(path):
@@ -13,7 +26,8 @@ def find_executable(name, search_dirs):
             return path_exe
     return None
 
-def main():
+def main() -> None:
+    """Run the engine tournament utilizing cutechess-cli."""
     root_dir = os.path.abspath(os.path.dirname(__file__))
     search_dirs = [
         root_dir,
@@ -23,16 +37,16 @@ def main():
     # Find executables
     stockfish_path = find_executable("stockfish", search_dirs)
     if not stockfish_path:
-        print("Error: Could not find stockfish or stockfish.exe in root or cutechess folders.")
+        logging.error("Could not find stockfish or stockfish.exe in root or cutechess folders.")
         sys.exit(1)
         
     cutechess_path = find_executable("cutechess-cli", search_dirs)
     if not cutechess_path:
-        print("Error: Could not find cutechess-cli or cutechess-cli.exe in root or cutechess folders.")
+        logging.error("Could not find cutechess-cli or cutechess-cli.exe in root or cutechess folders.")
         sys.exit(1)
 
-    print(f"Found Stockfish: {stockfish_path}")
-    print(f"Found cutechess: {cutechess_path}")
+    logging.info(f"Found Stockfish: {stockfish_path}")
+    logging.info(f"Found cutechess: {cutechess_path}")
 
     # Define our engine configurations
     hybrid_bat = os.path.join(root_dir, "run_hybrid_beast.bat")
@@ -71,10 +85,8 @@ def main():
         tournament_cmd += f" {opp}"
     tournament_cmd += f" {flags}"
 
-    print("\n--- Executing Gauntlet Command ---")
-    print(tournament_cmd)
-    print("----------------------------------\n")
-    print("Tournament started! Live results will appear below...\n")
+    logging.info(f"Executing Gauntlet Command: {tournament_cmd}")
+    logging.info("Tournament started! Live results will appear below...")
 
     # Run the tournament and stream output
     try:
@@ -93,19 +105,19 @@ def main():
                 break
             if output:
                 # Print output directly to our console
-                print(output.strip())
+                print(output.strip(), flush=True)
                 
         return_code = process.poll()
         if return_code == 0:
-            print("\nTournament Completed Successfully!")
+            logging.info("Tournament Completed Successfully!")
         else:
-            print(f"\nTournament exited with error code {return_code}")
+            logging.error(f"Tournament exited with error code {return_code}")
             
     except KeyboardInterrupt:
-        print("\nTournament interrupted by user.")
+        logging.warning("Tournament interrupted by user.")
         process.terminate()
     except Exception as e:
-        print(f"\nError running tournament: {e}")
+        logging.error(f"Error running tournament: {e}")
 
 if __name__ == "__main__":
     main()

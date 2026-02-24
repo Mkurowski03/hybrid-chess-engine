@@ -1,14 +1,15 @@
 """Hybrid Rust/Python Engine combining Rust MCTS with PyTorch."""
 
-import time
+import logging
 import sys
+import time
 from pathlib import Path
-from typing import Optional
+from typing import Optional, List, Dict, Any
 
 import chess
 import numpy as np
 import torch
-import logging
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from config import ModelConfig
@@ -27,17 +28,26 @@ def _move_to_policy_index(move: chess.Move, turn: chess.Color) -> int:
 try:
     import chess_engine_core
 except ImportError:
-    print("chess_engine_core not found! Please build the rust extension first.")
+    logging.error("chess_engine_core not found! Please build the rust extension first.")
     sys.exit(1)
 
 
 class HybridEngine:
+    """Hybrid Rust/Python Engine combining Rust MCTS with PyTorch."""
+
     def __init__(
         self,
         checkpoint_path: str | Path | None = None,
         device: str = "cuda",
-        model_cfg: ModelConfig | None = None,
+        model_cfg: Optional[ModelConfig] = None,
     ) -> None:
+        """Initialize the Hybrid Engine.
+
+        Args:
+            checkpoint_path (str | Path | None): Path to the PyTorch model checkpoint.
+            device (str): Device to use for inference (e.g., "cuda" or "cpu").
+            model_cfg (Optional[ModelConfig]): Configuration for the model.
+        """
         self.device = torch.device(device if torch.cuda.is_available() else "cpu")
 
         # ---- model ----
@@ -64,7 +74,23 @@ class HybridEngine:
         winc: int = 0,
         binc: int = 0
     ) -> chess.Move:
-        """Select a move using Rust MCTS + PyTorch Network."""
+        """Select a move using Rust MCTS + PyTorch Network.
+
+        Args:
+            board (chess.Board): The current board state.
+            sims (int): Number of MCTS simulations. Default is 600.
+            cpuct (float): PUCT exploration constant. Default is 1.25.
+            material_weight (float): Material bias weight. Default is 0.15.
+            discount (float): Discount factor for delayed checkmates. Default is 0.90.
+            batch_size (int): Execution batch size. Default is 16.
+            wtime (Optional[int]): White time remaining in milliseconds.
+            btime (Optional[int]): Black time remaining in milliseconds.
+            winc (int): White increment per move in milliseconds.
+            binc (int): Black increment per move in milliseconds.
+
+        Returns:
+            chess.Move: The selected best move.
+        """
         
         # --- SAFETY OVERRIDE: HARDCODED MATE-IN-1 ---
         for move in board.legal_moves:
@@ -191,7 +217,14 @@ class HybridEngine:
             return legal[0]
 
     def evaluate(self, board: chess.Board) -> float:
-        """Return the value-head evaluation in ``[-1, 1]`` for the side to move."""
+        """Return the value-head evaluation in ``[-1, 1]`` for the side to move.
+
+        Args:
+            board (chess.Board): The current board state.
+
+        Returns:
+            float: Evaluation score from -1.0 to 1.0.
+        """
         state = torch.from_numpy(encode_board(board)).unsqueeze(0).to(self.device)
         with torch.inference_mode():
             if self.device.type == "cuda":
@@ -202,8 +235,17 @@ class HybridEngine:
         return float(value.item())
 
     @torch.no_grad()
-    def top_moves(self, board: chess.Board, n: int = 5, **kwargs) -> list[dict]:
-        """Return top-N legal moves with probabilities from the policy head."""
+    def top_moves(self, board: chess.Board, n: int = 5, **kwargs: Any) -> list[dict]:
+        """Return top-N candidate moves with probabilities from the policy head.
+
+        Args:
+            board (chess.Board): The current board state.
+            n (int): Number of top moves to return.
+            kwargs (Any): Additional keyword arguments.
+
+        Returns:
+            list[dict]: List of dictionaries containing top moves and probabilities.
+        """
         state = torch.from_numpy(encode_board(board)).unsqueeze(0).to(self.device)
 
         if self.device.type == "cuda":

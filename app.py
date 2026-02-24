@@ -10,14 +10,18 @@ Usage
 from __future__ import annotations
 
 import argparse
-import json
 import glob
-from pathlib import Path
-
+import json
+import logging
 import os
+from pathlib import Path
+from typing import Dict, Any, List
+
 import chess
-from flask import Flask, jsonify, request, send_from_directory
+from flask import Flask, jsonify, request, send_from_directory, Response
 from flask_cors import CORS
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 
 from src.hybrid_engine import HybridEngine
 from config import ModelConfig
@@ -48,12 +52,13 @@ def _find_checkpoints() -> list[dict]:
 
 
 @app.route("/")
-def index():
+def index() -> Response:
+    """Serve the index page."""
     return send_from_directory("static", "index.html")
 
 
 @app.route("/api/move", methods=["POST"])
-def api_move():
+def api_move() -> tuple[Response, int] | Response:
     """Receive a FEN, return the engine's best move + evaluation."""
     data = request.get_json()
     fen = data.get("fen")
@@ -119,8 +124,8 @@ def api_move():
 
 
 @app.route("/api/top_moves", methods=["POST"])
-def api_top_moves():
-    """Return top-5 candidate moves with probabilities."""
+def api_top_moves() -> tuple[Response, int] | Response:
+    """Return top-N candidate moves with probabilities."""
     data = request.get_json()
     fen = data.get("fen")
     n = data.get("n", 5)
@@ -155,7 +160,7 @@ def api_top_moves():
 
 
 @app.route("/api/evaluate", methods=["POST"])
-def api_evaluate():
+def api_evaluate() -> tuple[Response, int] | Response:
     """Return evaluation for a position."""
     data = request.get_json()
     fen = data.get("fen")
@@ -170,13 +175,13 @@ def api_evaluate():
 
 
 @app.route("/api/checkpoints")
-def api_checkpoints():
+def api_checkpoints() -> Response:
     """List available model checkpoints."""
     return jsonify(_find_checkpoints())
 
 
 @app.route("/api/load_checkpoint", methods=["POST"])
-def api_load_checkpoint():
+def api_load_checkpoint() -> tuple[Response, int] | Response:
     """Switch to a different checkpoint."""
     global engine
     data = request.get_json()
@@ -201,7 +206,8 @@ def api_load_checkpoint():
     return jsonify({"status": "loaded", "path": path})
 
 
-def main():
+def main() -> None:
+    """Run the Flask server."""
     global engine
 
     parser = argparse.ArgumentParser(description="ChessNet-3070 Play Server")
@@ -218,7 +224,7 @@ def main():
         candidates = sorted(Path("checkpoints").rglob("*.pt"))
         if candidates:
             checkpoint = str(candidates[-1])
-            print(f"  Auto-selected: {checkpoint}")
+            logging.info(f"Auto-selected: {checkpoint}")
 
     if checkpoint:
         # Read model config if available
@@ -234,13 +240,12 @@ def main():
             if "num_residual_blocks" in model_section:
                 model_cfg.num_residual_blocks = model_section["num_residual_blocks"]
         engine = HybridEngine(checkpoint_path=checkpoint, model_cfg=model_cfg)
-        print(f"  [+] Model loaded: {checkpoint}")
+        logging.info(f"Model loaded: {checkpoint}")
     else:
         engine = HybridEngine(checkpoint_path=None)
-        print("  [!] No checkpoint found — using random weights!")
+        logging.warning("No checkpoint found — using random weights!")
 
-    import inspect
-    print(f"\n  Open http://{args.host}:{args.port} in your browser\n")
+    logging.info(f"Open http://{args.host}:{args.port} in your browser")
     app.run(host=args.host, port=args.port, debug=False)
 
 

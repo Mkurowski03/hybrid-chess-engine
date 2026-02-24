@@ -122,6 +122,8 @@ pub fn encode_rust_board<'py>(pos: &Chess, py: Python<'py>) -> PyResult<Bound<'p
         }
     }
 
+    // SAFETY: Translates the Rust `ndarray` to a Python numpy object dynamically.
+    // `into_pyarray_bound` executes a zero-copy transfer of the heap-allocated Rust array into Python space.
     Ok(planes.into_pyarray_bound(py))
 }
 

@@ -1,24 +1,26 @@
-import sys
 import argparse
-import chess
+import logging
+import sys
 from pathlib import Path
+
+import chess
 
 # Allow direct imports when run from project root.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from config import ModelConfig
 from src.hybrid_engine import HybridEngine
-import logging
 
 logging.basicConfig(
     filename='live_engine.log',
     level=logging.INFO,
-    format='%(asctime)s %(message)s'
+    format='%(asctime)s %(levelname)s: %(message)s'
 )
 
 PIECE_VALUES = {"1": 1, "2": 3, "3": 3, "4": 5, "5": 9}
 
-def main():
+def main() -> None:
+    """Run the UCI protocol."""
     parser = argparse.ArgumentParser(description="ChessNet-3070 UCI Engine")
     parser.add_argument("--model", type=str, default="checkpoints/baseline/chessnet_epoch9.pt", help="Path to checkpoint")
     parser.add_argument("--sims", type=int, default=600, help="Number of MCTS simulations")
@@ -51,14 +53,12 @@ def main():
             command = tokens[0]
 
             if command == "uci":
-                print("id name ChessNet-3070")
-                print("id author You")
-                print("uciok")
-                sys.stdout.flush()
+                print("id name ChessNet-3070", flush=True)
+                print("id author You", flush=True)
+                print("uciok", flush=True)
                 
             elif command == "isready":
-                print("readyok")
-                sys.stdout.flush()
+                print("readyok", flush=True)
                 
             elif command == "ucinewgame":
                 board = chess.Board()
@@ -111,8 +111,7 @@ def main():
                     winc=winc,
                     binc=binc
                 )
-                print(f"bestmove {best_move.uci()}")
-                sys.stdout.flush()
+                print(f"bestmove {best_move.uci()}", flush=True)
                 
             elif command == "quit":
                 break
