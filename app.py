@@ -31,7 +31,12 @@ CORS(app)
 
 # Load Engine
 CHECKPOINT_PATH = "checkpoints/baseline/chessnet_epoch9.pt"
-engine = HybridEngine(CHECKPOINT_PATH)
+BOOK_PATH = "books/opening_book.bin"
+
+if not Path(BOOK_PATH).exists():
+    BOOK_PATH = None
+
+engine = HybridEngine(checkpoint_path=CHECKPOINT_PATH, book_path=BOOK_PATH)
 
 
 def _find_checkpoints() -> list[dict]:
@@ -202,7 +207,7 @@ def api_load_checkpoint() -> tuple[Response, int] | Response:
         if "num_residual_blocks" in model_section:
             model_cfg.num_residual_blocks = model_section["num_residual_blocks"]
 
-    engine = HybridEngine(checkpoint_path=path, model_cfg=model_cfg)
+    engine = HybridEngine(checkpoint_path=path, model_cfg=model_cfg, book_path=BOOK_PATH)
     return jsonify({"status": "loaded", "path": path})
 
 
@@ -213,6 +218,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="ChessNet-3070 Play Server")
     parser.add_argument("--checkpoint", type=str, default=None,
                         help="Path to model checkpoint .pt file")
+    parser.add_argument("--book", type=str, default="books/opening_book.bin",
+                        help="Path to Polyglot opening book .bin file")
     parser.add_argument("--port", type=int, default=5000)
     parser.add_argument("--host", type=str, default="127.0.0.1")
     args = parser.parse_args()
@@ -239,10 +246,10 @@ def main() -> None:
                 model_cfg.num_filters = model_section["num_filters"]
             if "num_residual_blocks" in model_section:
                 model_cfg.num_residual_blocks = model_section["num_residual_blocks"]
-        engine = HybridEngine(checkpoint_path=checkpoint, model_cfg=model_cfg)
+        engine = HybridEngine(checkpoint_path=checkpoint, model_cfg=model_cfg, book_path=args.book)
         logging.info(f"Model loaded: {checkpoint}")
     else:
-        engine = HybridEngine(checkpoint_path=None)
+        engine = HybridEngine(checkpoint_path=None, book_path=args.book)
         logging.warning("No checkpoint found — using random weights!")
 
     logging.info(f"Open http://{args.host}:{args.port} in your browser")

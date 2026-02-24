@@ -598,3 +598,8 @@
 2026-02-24 22:19:36,478 Panic Mode: Time low! Capping sims to 18837. alloc=2898.0ms safe=26960.0ms
 2026-02-24 22:19:38,425 [DONE] Move: g4e6 | Sims: 2468 | Time Used: 1.95s | NPS: 1267
 2026-02-24 22:19:38,448 [START] Time allocated: wtime=10314, btime=28009, winc=2000, binc=2000
+2026-02-24 23:24:12,933 INFO: [START] Time allocated: wtime=300000, btime=300000, winc=0, binc=0
+2026-02-24 23:24:12,934 INFO: Panic Mode: Time low! Capping sims to 600. alloc=15000.0ms safe=299000.0ms
+2026-02-24 23:24:13,553 INFO: [DONE] Move: e2e4 | Sims: 640 | Time Used: 0.62s | NPS: 1034
+2026-02-24 23:26:01,922 INFO: [START] Time allocated: wtime=300000, btime=300000, winc=0, binc=0
+2026-02-24 23:26:01,923 INFO: [BOOK] Found move c2c4 (weight: 1)

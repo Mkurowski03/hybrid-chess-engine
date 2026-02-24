@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Optional, List, Dict, Any
 
 import chess
+import chess.polyglot
 import numpy as np
 import torch
 
@@ -40,6 +41,7 @@ class HybridEngine:
         checkpoint_path: str | Path | None = None,
         device: str = "cuda",
         model_cfg: Optional[ModelConfig] = None,
+        book_path: str | Path | None = None,
     ) -> None:
         """Initialize the Hybrid Engine.
 
@@ -47,7 +49,9 @@ class HybridEngine:
             checkpoint_path (str | Path | None): Path to the PyTorch model checkpoint.
             device (str): Device to use for inference (e.g., "cuda" or "cpu").
             model_cfg (Optional[ModelConfig]): Configuration for the model.
+            book_path (str | Path | None): Path to a Polyglot opening book (.bin).
         """
+        self.book_path = book_path
         self.device = torch.device(device if torch.cuda.is_available() else "cpu")
 
         # ---- model ----
@@ -100,6 +104,20 @@ class HybridEngine:
                 board.pop()
                 return move
             board.pop()
+        # --------------------------------------------
+        
+        # --- OPENING BOOK SUPPORT ---
+        if self.book_path and Path(self.book_path).exists():
+            try:
+                with chess.polyglot.open_reader(self.book_path) as reader:
+                    entry = reader.weighted_choice(board)
+                    if entry:
+                        logging.info(f"[BOOK] Found move {entry.move.uci()} (weight: {entry.weight})")
+                        return entry.move
+            except IndexError:
+                pass
+            except Exception as e:
+                logging.warning(f"Error reading opening book: {e}")
         # --------------------------------------------
 
         legal = list(board.legal_moves)

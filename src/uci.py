@@ -28,14 +28,16 @@ def main() -> None:
     parser.add_argument("--discount", type=float, default=0.90, help="Checkmate discount factor")
     parser.add_argument("--material", type=float, default=0.15, help="Material weight")
     parser.add_argument("--batch_size", type=int, default=128, help="Batch size for GPU MCTS")
+    parser.add_argument("--book", type=str, default="books/opening_book.bin", help="Path to Polyglot opening book")
     args = parser.parse_args()
 
     # Load engine once at startup
     try:
         checkpoint = args.model
+        book_path = args.book if Path(args.book).is_file() else None
         # Optionally, override device if needed
         model_cfg = ModelConfig()
-        engine = HybridEngine(checkpoint, device="cuda", model_cfg=model_cfg)
+        engine = HybridEngine(checkpoint, device="cuda", model_cfg=model_cfg, book_path=book_path)
     except Exception as e:
         msg = f"Failed to load checkpoint '{checkpoint}': {e}"
         sys.stderr.write(f"Error loading engine: {msg}\n")
