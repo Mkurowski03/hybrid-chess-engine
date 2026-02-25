@@ -234,8 +234,9 @@ impl RustMCTS {
                     // Simplification Bias
                     let parent_piece_count = self.nodes[curr].pos.board().occupied().count();
                     if parent_piece_count <= 7 {
+                        // The max output of Q is 1.0. A score of +0.3 is generally a highly decisive win in AlphaZero scaling.
                         let parent_q = if parent_visits > 0 { self.nodes[curr].value_sum / parent_visits as f32 } else { 0.0 };
-                        if parent_q > 0.8 {
+                        if parent_q > 0.3 {
                             let child_piece_count = child.pos.board().occupied().count();
                             let is_capture = child_piece_count < parent_piece_count;
                             let is_promotion = child.action.as_ref().map_or(false, |a| a.len() == 5);
@@ -471,6 +472,7 @@ impl RustMCTS {
         for &child_id in &self.nodes[self.root].children {
             let n = self.nodes[child_id].visits;
             if n > best_n {
+                // Shift down
                 second_best_n = best_n;
                 best_n = n;
             } else if n > second_best_n {

@@ -17,6 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from config import ModelConfig
 from src.board_encoder import encode_board
 from src.model import ChessNet, build_model
+from src.neural_backend import NeuralBackend, PyTorchBackend, ONNXBackend
 
 def _move_to_policy_index(move: chess.Move, turn: chess.Color) -> int:
     """Encode a ``chess.Move`` into a policy index."""
@@ -56,20 +57,29 @@ class HybridEngine:
         self.device = torch.device(device if torch.cuda.is_available() else "cpu")
         self.model_cfg = model_cfg
         
-        # ---- model ----
-        self.model: ChessNet = build_model(model_cfg)
-        if checkpoint_path is not None:
-            ckpt = torch.load(
-                checkpoint_path, map_location=self.device, weights_only=True,
-            )
-            state_dict = ckpt.get("model_state_dict", ckpt)
-            self.model.load_state_dict(state_dict)
-        if self.device.type == "cuda":
-            self.model.half()
-            torch.backends.cudnn.benchmark = True
-            torch.backends.cudnn.deterministic = False
-        self.model.to(self.device)
-        self.model.eval()
+        # ---- inference backend ----
+        cp = Path(checkpoint_path) if checkpoint_path else None
+        if cp is not None and cp.suffix == ".onnx":
+            self.backend: NeuralBackend = ONNXBackend(cp)
+            self.model = None  # Not needed for ONNX
+            logging.info(f"Using ONNX backend: {cp}")
+        else:
+            model: ChessNet = build_model(model_cfg)
+            if cp is not None:
+                ckpt = torch.load(
+                    str(cp), map_location=self.device, weights_only=True,
+                )
+                state_dict = ckpt.get("model_state_dict", ckpt)
+                model.load_state_dict(state_dict)
+            if self.device.type == "cuda":
+                model.half()
+                torch.backends.cudnn.benchmark = True
+                torch.backends.cudnn.deterministic = False
+            model.to(self.device)
+            model.eval()
+            self.model = model
+            self.backend = PyTorchBackend(model, self.device)
+            logging.info(f"Using PyTorch backend: {cp}")
         
         # ---- syzygy ----
         self.tablebase = None
@@ -261,20 +271,9 @@ class HybridEngine:
 
 
 
-            # 2. PyTorch evaluates on GPU
-            # Convert list of 3D numpy arrays to a single 4D Torch tensor (B, 18, 8, 8)
+            # 2. Neural Backend evaluates on GPU (PyTorch or ONNX)
             states_np = np.stack(tensors)
-            input_cuda = torch.from_numpy(states_np).to(self.device)
-            if self.device.type == "cuda":
-                input_cuda = input_cuda.half()
-            
-            with torch.inference_mode():
-                # We have explicitly made model and input .half()
-                policy, value = self.model(input_cuda)
-
-            # Ensure we convert back to float32 before numpy/Rust transition 
-            policy_np = policy.float().cpu().numpy() # Shape: (B, 4096)
-            value_np = value.float().cpu().numpy().flatten() # Shape: (B,)
+            policy_np, value_np = self.backend.predict(states_np)
             
             # --- SYZYGY MCTS LEAF OVERRIDE ---
             if self.tablebase is not None:
