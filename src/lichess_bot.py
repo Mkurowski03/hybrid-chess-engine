@@ -1,342 +1,369 @@
+#!/usr/bin/env python3
+"""
+Lichess Bot Interface for ChessNet-3070.
+Handles connection to Lichess API, tournament matchmaking, and threaded game execution.
+"""
+
 import argparse
+import json
+import logging
 import os
+import random
 import sys
 import threading
 import time
-import json
-import random
+from pathlib import Path
+from typing import Dict, List, Optional, Any
 
 import berserk
 import chess
-
-from pathlib import Path
 from dotenv import load_dotenv
 
-# Load env variables from .env file
+# Load environment variables
 load_dotenv()
 
-# Add project root to path
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+# Project root setup
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.engine import ChessEngine
 from config import ModelConfig
 
-CHECKPOINT_PATH = "checkpoints/baseline/chessnet_epoch9.pt"
+# --- Configuration ---
+LOG_FORMAT = '%(asctime)s [%(levelname)s] %(message)s'
+logging.basicConfig(level=logging.INFO, format=LOG_FORMAT, datefmt='%H:%M:%S')
+logger = logging.getLogger(__name__)
+
 LICHESS_TOKEN = os.getenv("LICHESS_TOKEN")
 SYZYGY_PATH = os.getenv("SYZYGY_PATH")
-EXPERIMENTS_FILE = "experiments.json"
-RESULTS_FILE = "tournament_results.json"
-DEVICE = "cuda"
+EXPERIMENTS_FILE = Path("experiments.json")
+RESULTS_FILE = Path("tournament_results.json")
 
-if not LICHESS_TOKEN:
-    print("Error: LICHESS_TOKEN environment variable not found.")
-    print("Please set it in your terminal: $env:LICHESS_TOKEN='your_token'")
-    sys.exit(1)
+# Default targets for tournament mode
+TOURNAMENT_BOTS = [
+    "Boris-Trapsky", "Humaia", "turkjs", "LeelaRogue", "TuroBot", "Elmichess", "Cimille"
+]
+
+# Lock for thread-safe file writes
+RESULTS_LOCK = threading.Lock()
+
+
+class GameSession:
+    """
+    Manages the lifecycle of a single chess game in its own thread.
+    """
+    def __init__(self, game_id: str, client: berserk.Client, profile: dict, engine: ChessEngine, bot_id: str):
+        self.game_id = game_id
+        self.client = client
+        self.profile = profile
+        self.engine = engine
+        self.bot_id = bot_id
+        self.board = chess.Board()
+        self.is_white = True  # Will be updated on init
+        self.opponent_name = "Unknown"
+        self.opponent_rating = "?"
+
+    def run(self):
+        """Main game loop listening to the event stream."""
+        logger.info(f"[{self.profile['name']}] Connected to game {self.game_id}")
+        
+        try:
+            for event in self.client.bots.stream_game_state(self.game_id):
+                if event['type'] == 'gameFull':
+                    self._handle_full_state(event)
+                elif event['type'] == 'gameState':
+                    self._handle_state_update(event)
+                elif event['type'] == 'chatLine':
+                    pass
+        except Exception:
+            logger.exception(f"Game {self.game_id} crashed unexpectedly")
+        finally:
+            logger.info(f"Game {self.game_id} session ended.")
+
+    def _handle_full_state(self, event: dict):
+        """Initialize board and metadata from the full game state."""
+        self.is_white = (event['white'].get('id') == self.bot_id)
+        
+        # Extract opponent info
+        opp_color = 'black' if self.is_white else 'white'
+        opp_data = event[opp_color]
+        self.opponent_name = opp_data.get('name', 'Unknown')
+        self.opponent_rating = opp_data.get('rating', '?')
+        
+        logger.info(f"Match: {self.profile['name']} vs {self.opponent_name} ({self.opponent_rating})")
+
+        # Replay existing moves
+        state = event['state']
+        self._apply_moves(state.get('moves', ''))
+        self._attempt_move()
+
+    def _handle_state_update(self, state: dict):
+        """Handle incremental updates."""
+        # Check if game is over
+        if state.get('status') != 'started':
+            self._save_result(state)
+            return
+
+        self._apply_moves(state.get('moves', ''))
+        self._attempt_move()
+
+    def _apply_moves(self, moves_str: str):
+        self.board.reset()
+        if moves_str:
+            for uci in moves_str.split():
+                self.board.push(chess.Move.from_uci(uci))
+
+    def _attempt_move(self):
+        """Checks turn and asks engine for a move if it's our turn."""
+        if self.board.is_game_over():
+            return
+
+        # Turn check
+        is_my_turn = (self.board.turn == chess.WHITE and self.is_white) or \
+                     (self.board.turn == chess.BLACK and not self.is_white)
+        
+        if not is_my_turn:
+            return
+
+        # Prepare Engine Arguments
+        cfg = self.profile['config']
+        sims = cfg.get('simulations', 800)
+        
+        # Parse piece values if custom
+        p_vals = None
+        if 'piece_values' in cfg:
+            p_vals = {int(k): float(v) for k, v in cfg['piece_values'].items()}
+
+        engine_kwargs = {
+            'cpuct': cfg.get('cpuct', 2.0),
+            'material_weight': cfg.get('material_weight', 0.2),
+            'discount': cfg.get('discount', 0.90),
+            'piece_values': p_vals,
+            'book_strategy': cfg.get('book_strategy', 'best')
+        }
+
+        # Select Move
+        logger.debug(f"Thinking... (Sims: {sims})")
+        try:
+            # We don't have exact clock times from the stream easily available in this loop structure
+            # without parsing 'wtime'/'btime' from state updates. 
+            # For simplicity in this bot wrapper, we rely on the engine's default time management 
+            # or static allocation if wtime isn't passed.
+            move = self.engine.select_move(self.board, simulations=sims, **engine_kwargs)
+            
+            self.client.bots.make_move(self.game_id, move.uci())
+            logger.info(f"[{self.profile['name']}] Played {move.uci()}")
+            
+        except Exception:
+            logger.exception(f"Engine failure in game {self.game_id}")
+
+    def _save_result(self, state: dict):
+        """Writes game result to JSON with thread safety."""
+        winner = state.get('winner')
+        status = state.get('status')
+        
+        if winner is None:
+            outcome = "draw"
+        elif (winner == 'white' and self.is_white) or (winner == 'black' and not self.is_white):
+            outcome = "win"
+        else:
+            outcome = "loss"
+
+        result_entry = {
+            "timestamp": time.time(),
+            "game_id": self.game_id,
+            "profile": self.profile['name'],
+            "opponent": self.opponent_name,
+            "opponent_rating": self.opponent_rating,
+            "outcome": outcome,
+            "status": status,
+            "moves": self.board.fullmove_number,
+            "config": self.profile['config']
+        }
+
+        with RESULTS_LOCK:
+            try:
+                data = []
+                if RESULTS_FILE.exists():
+                    with open(RESULTS_FILE, 'r') as f:
+                        data = json.load(f)
+                
+                data.append(result_entry)
+                
+                with open(RESULTS_FILE, 'w') as f:
+                    json.dump(data, f, indent=2)
+                
+                logger.info(f"Result saved: {outcome.upper()} vs {self.opponent_name}")
+            except Exception as e:
+                logger.error(f"Failed to save result: {e}")
+
 
 class LichessBot:
-    def __init__(self, token):
+    def __init__(self, token: str):
+        if not token:
+            logger.critical("LICHESS_TOKEN is missing. Check your .env file.")
+            sys.exit(1)
+
         self.session = berserk.TokenSession(token)
         self.client = berserk.Client(self.session)
         
+        # User Info
         try:
-             self.bot_id = self.client.account.get()['id']
-             self.bot_name = self.client.account.get()['username']
-        except:
-             print("Warning: Could not get bot account details. Token might be invalid or permissions missing.")
-             self.bot_id = None
-             self.bot_name = "UnknownBot"
-             
-        self.games = {} # game_id -> {'board': board, 'is_white': bool}
-        self.profiles = self._load_profiles()
-        self.engines = {} # model_path -> ChessEngine instance
-        self.active_games = {} # game_id -> profile configuration
+            account = self.client.account.get()
+            self.bot_id = account['id']
+            self.bot_name = account['username']
+            logger.info(f"Authenticated as {self.bot_name} ({self.bot_id})")
+        except berserk.exceptions.ResponseError as e:
+            logger.critical(f"Authentication failed: {e}")
+            sys.exit(1)
 
-    def _load_profiles(self):
+        # Resources
+        self.profiles = self._load_profiles()
+        self.engines: Dict[str, ChessEngine] = {}
+        self.active_games: Dict[str, threading.Thread] = {}
+
+    def _load_profiles(self) -> List[dict]:
+        if not EXPERIMENTS_FILE.exists():
+            logger.critical(f"{EXPERIMENTS_FILE} not found.")
+            sys.exit(1)
+            
         try:
             with open(EXPERIMENTS_FILE, 'r') as f:
                 data = json.load(f)
                 active = [p for p in data if p.get("active", False)]
                 if not active:
-                    print(f"No active profiles found in {EXPERIMENTS_FILE}!")
-                    sys.exit(1)
+                    logger.warning("No active profiles found in experiments.json")
                 return active
         except Exception as e:
-            print(f"Error loading {EXPERIMENTS_FILE}: {e}. Ensure the file exists in the project root.")
+            logger.critical(f"Invalid experiments.json: {e}")
             sys.exit(1)
 
-    def _get_engine(self, model_path):
-        """Lazy load and cache engines based on model path."""
-        # Convert to absolute or project-relative if needed, assuming run from root
+    def get_engine(self, model_path: str) -> ChessEngine:
+        """Lazy-loads and caches engine instances to save VRAM."""
         if model_path not in self.engines:
-            print(f"Loading engine globally for {model_path}...")
-            try:
-                self.engines[model_path] = ChessEngine(model_path, syzygy_path=SYZYGY_PATH, device=DEVICE)
-            except Exception as e:
-                print(f"CRITICAL ERROR: Failed to load engine at {model_path}. {e}")
-                sys.exit(1)
+            logger.info(f"Initializing engine: {model_path} (Syzygy={bool(SYZYGY_PATH)})")
+            self.engines[model_path] = ChessEngine(
+                checkpoint_path=model_path,
+                syzygy_path=SYZYGY_PATH,
+                device="cuda" if os.getenv("DEVICE", "cuda") == "cuda" else "cpu"
+            )
         return self.engines[model_path]
 
     def run(self):
-        print(f"Connecting to Lichess as {self.bot_name}...")
-        print(f"Loaded {len(self.profiles)} active tournament profiles.")
-        
-        # Generator for events
-        for event in self.client.bots.stream_incoming_events():
-            if event['type'] == 'challenge':
-                self._handle_challenge(event['challenge'])
-            elif event['type'] == 'gameStart':
-                self._start_game_thread(event['game']['id'])
-
-    def _handle_challenge(self, challenge):
-        print(f"Challenge from {challenge['challenger']['name']}")
+        """Main event loop."""
+        logger.info("Listening for events...")
         try:
-            self.client.bots.accept_challenge(challenge['id'])
-            print(f"Accepted challenge {challenge['id']}")
-        except Exception as e:
-            print(f"Failed to accept: {e}")
+            for event in self.client.bots.stream_incoming_events():
+                if event['type'] == 'challenge':
+                    self._handle_challenge(event['challenge'])
+                elif event['type'] == 'gameStart':
+                    self._start_game(event['game']['id'])
+        except KeyboardInterrupt:
+            logger.info("Stopping bot...")
+        except Exception:
+            logger.exception("Event stream connection lost")
 
-    def _start_game_thread(self, game_id):
-        # Temporary assignment to avoid None, will be reassigned smartly in _init_game
-        profile = random.choice(self.profiles)
-        self.active_games[game_id] = profile
+    def _handle_challenge(self, challenge: dict):
+        c_id = challenge['id']
+        challenger = challenge['challenger']['name']
+        logger.info(f"Challenge received from {challenger}")
         
-        t = threading.Thread(target=self._play_game, args=(game_id,))
-        t.daemon = True
+        # Accept everything for now (add filters here if needed)
+        try:
+            self.client.bots.accept_challenge(c_id)
+            logger.info(f"Accepted challenge {c_id}")
+        except berserk.exceptions.ResponseError as e:
+            logger.error(f"Could not accept challenge: {e}")
+
+    def _start_game(self, game_id: str):
+        """Spawns a new GameSession thread."""
+        # Clean up finished threads
+        self.active_games = {g: t for g, t in self.active_games.items() if t.is_alive()}
+
+        if not self.profiles:
+            logger.error("No profiles available to play!")
+            return
+
+        # 1. Smart Selection: Pick profile with fewest games against this opponent?
+        # Since we don't know the opponent yet (stream hasn't started), pick Random for now.
+        # The GameSession can refine logic if needed, but simple random is robust.
+        profile = random.choice(self.profiles)
+        
+        # 2. Get Engine
+        model_path = profile['config'].get('model_path', 'checkpoints/baseline/chessnet_epoch9.pt')
+        engine = self.get_engine(model_path)
+
+        # 3. Launch Thread
+        session = GameSession(game_id, self.client, profile, engine, self.bot_id)
+        t = threading.Thread(target=session.run, daemon=True, name=f"Game-{game_id}")
+        t.start()
+        
+        self.active_games[game_id] = t
+
+    def start_tournament_mode(self):
+        """Background thread to actively seek games against target bots."""
+        def seeker():
+            logger.info("Tournament Seeker Started.")
+            while True:
+                current_load = len([t for t in self.active_games.values() if t.is_alive()])
+                
+                if current_load < 3:
+                    try:
+                        self._seek_game()
+                    except Exception as e:
+                        logger.error(f"Seek error: {e}")
+                
+                time.sleep(45) # Rate limit protection
+
+        t = threading.Thread(target=seeker, daemon=True, name="TournamentSeeker")
         t.start()
 
-    def _play_game(self, game_id):
-        print(f"Starting tracking for game {game_id}")
-        import traceback
-        try:
-            # Stream game state
-            for event in self.client.bots.stream_game_state(game_id):
-                if event['type'] == 'gameFull':
-                    self._init_game(game_id, event)
-                elif event['type'] == 'gameState':
-                    self._handle_state_change(game_id, event)
-                elif event['type'] == 'chatLine':
-                    pass
-        except Exception:
-            print(f"Game {game_id} crashed:")
-            traceback.print_exc()
-        finally:
-            if game_id in self.games:
-                del self.games[game_id]
-            if game_id in self.active_games:
-                del self.active_games[game_id]
-            print(f"Game {game_id} removed from tracking.")
+    def _seek_game(self):
+        """Determine next opponent and send challenge."""
+        # Load history to balance matchups
+        history = []
+        if RESULTS_FILE.exists():
+            with open(RESULTS_FILE, 'r') as f:
+                history = json.load(f)
 
-    def _get_opponent_rating(self, event, my_color):
-        """Extract opponent's rating from game state."""
-        opp_color = 'black' if my_color == 'white' else 'white'
-        try:
-            return event[opp_color].get('rating', 'Unknown')
-        except:
-            return 'Unknown'
+        # Count matches
+        counts = {bot: 0 for bot in TOURNAMENT_BOTS}
+        for h in history:
+            opp = h.get('opponent')
+            if opp in counts:
+                counts[opp] += 1
+        
+        # Find underserved opponents
+        # Target: 2 games per profile per opponent
+        target_count = len(self.profiles) * 2
+        candidates = [b for b, c in counts.items() if c < target_count]
 
-    def _init_game(self, game_id, event):
-        board = chess.Board()
-        
-        # Check if my turn
-        white_id = event['white'].get('id')
-        is_white = (white_id == self.bot_id)
-        my_color = 'white' if is_white else 'black'
-        
-        # Get opponent info for logging
-        opp_color_key = 'black' if is_white else 'white'
-        opp_name = event[opp_color_key].get('name', 'Unknown')
-        opp_rating = self._get_opponent_rating(event, my_color)
-        
-        # Smart Profile Assignment: balance games per opponent
-        try:
-            results = []
-            if os.path.exists(RESULTS_FILE):
-                with open(RESULTS_FILE, 'r') as f:
-                    results = json.load(f)
-            # Count games per profile against THIS opponent
-            counts = {p['name']: 0 for p in self.profiles}
-            for r in results:
-                if r.get('opponent') == opp_name and r.get('profile') in counts:
-                    counts[r['profile']] += 1
-            # Add currently active games
-            for g_id, prof in self.active_games.items():
-                if g_id in self.games and self.games[g_id].get('opp_name') == opp_name:
-                    if prof['name'] in counts:
-                        counts[prof['name']] += 1
-            best_profile = min(self.profiles, key=lambda p: counts[p['name']])
-            self.active_games[game_id] = best_profile
-        except Exception as e:
-            print(f"Matchmaking error, using random: {e}")
-            
-        profile_name = self.active_games[game_id]['name']
-        print(f"[{profile_name}] Game {game_id} vs {opp_name} (Rating: {opp_rating})")
-        
-        self.games[game_id] = {'board': board, 'is_white': is_white, 'opp_name': opp_name, 'opp_rating': opp_rating}
-        
-        # Replay any existing moves
-        state = event['state']
-        self._apply_moves(game_id, state['moves'])
-        self._attempt_move(game_id)
-
-    def _handle_state_change(self, game_id, state):
-        if game_id not in self.games:
-            return
-            
-        # Check if game ended
-        status = state.get('status')
-        if status and status != 'started':
-            self._record_result(game_id, state)
-            del self.games[game_id]
+        if not candidates:
+            logger.info("Tournament quota met. Waiting for new profiles or manual games.")
             return
 
-        self._apply_moves(game_id, state['moves'])
-        self._attempt_move(game_id)
-
-    def _apply_moves(self, game_id, moves_str):
-        data = self.games[game_id]
-        board = data['board']
-        board.reset()
-        if moves_str:
-            for uci in moves_str.split():
-                board.push(chess.Move.from_uci(uci))
-
-    def _attempt_move(self, game_id):
-        data = self.games[game_id]
-        board = data['board']
-        is_white = data['is_white']
-        
-        if board.is_game_over():
-             return # Handled by status check
-             
-        # Check turn
-        if board.turn == chess.WHITE and not is_white: return
-        if board.turn == chess.BLACK and is_white: return
-            
-        profile = self.active_games[game_id]
-        print(f"[{profile['name']}] Thinking on {game_id}...")
+        opponent = random.choice(candidates)
+        logger.info(f"Seeking match against {opponent} (10+0)...")
         
         try:
-            # 1. Get profile config
-            config = profile['config']
-            engine = self._get_engine(config.get('model_path', CHECKPOINT_PATH))
-            
-            # 2. Extract specific parameters
-            sims = config.get('simulations', 800)
-            
-            p_vals_raw = config.get('piece_values', None)
-            p_vals = None
-            if p_vals_raw:
-                p_vals = {int(k): float(v) for k, v in p_vals_raw.items()}
-                
-            kwargs = {
-                'cpuct': config.get('cpuct', 2.0),
-                'material_weight': config.get('material_weight', 0.2),
-                'discount': config.get('discount', 0.90),
-                'piece_values': p_vals
-            }
-
-            
-            # 3. Calculate move
-            move = engine.select_move(board, simulations=sims, **kwargs)
-            
-            # 4. Push to remote
-            self.client.bots.make_move(game_id, move.uci())
-            print(f"[{profile['name']}] Moved {move.uci()} in {game_id}")
-        except Exception as e:
-            print(f"Error making move on {game_id}: {e}")
-
-    def _record_result(self, game_id, state):
-        """Save the game result to tournament_results.json."""
-        if game_id not in self.active_games or game_id not in self.games: return
-        
-        profile = self.active_games[game_id]
-        game_data = self.games[game_id]
-        
-        status = state.get('status')
-        winner_color = state.get('winner') # 'white', 'black', or None
-        
-        # Determine outcome from bot's perspective
-        if winner_color is None:
-            outcome = "draw"
-        elif (winner_color == 'white' and game_data['is_white']) or (winner_color == 'black' and not game_data['is_white']):
-            outcome = "win"
-        else:
-            outcome = "loss"
-            
-        moves = state.get('moves', '').split()
-        
-        result_data = {
-            "timestamp": time.time(),
-            "game_id": game_id,
-            "profile": profile['name'],
-            "opponent": game_data['opp_name'],
-            "opponent_rating": game_data['opp_rating'],
-            "outcome": outcome,
-            "status": status,
-            "moves": len(moves),
-            "config": profile['config']
-        }
-        
-        try:
-            results = []
-            if os.path.exists(RESULTS_FILE):
-                with open(RESULTS_FILE, 'r') as f:
-                    results = json.load(f)
-            results.append(result_data)
-            with open(RESULTS_FILE, 'w') as f:
-                json.dump(results, f, indent=2)
-            print(f"[{profile['name']}] Result for {game_id} saved: {outcome.upper()} ({status})")
-        except Exception as e:
-            print(f"Error saving result for {game_id}: {e}")
+            self.client.challenges.create(
+                opponent, 
+                rated=True, 
+                clock_limit=600, 
+                clock_increment=0
+            )
+        except berserk.exceptions.ResponseError as e:
+            logger.warning(f"Challenge to {opponent} failed: {e}")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Lichess Bot tournament mode")
-    parser.add_argument("--seek", action="store_true", help="Auto-seek rated games")
+    parser = argparse.ArgumentParser(description="ChessNet Lichess Bot")
+    parser.add_argument("--seek", action="store_true", help="Enable active tournament seeking")
     args = parser.parse_args()
 
     bot = LichessBot(LICHESS_TOKEN)
 
     if args.seek:
-        print("Auto-Seek Enabled: Creating specialized 10-minute challenges...")
-        TARGET_BOTS = [
-            "Boris-Trapsky", "Humaia", "turkjs", "LeelaRogue", "TuroBot", "Elmichess", "Cimille"
-        ]
-        
-        def seeker():
-            while True:
-                if len(bot.games) < 3: # Allow up to 3 concurrent games for testing
-                    try:
-                        results = []
-                        if os.path.exists(RESULTS_FILE):
-                            with open(RESULTS_FILE, 'r') as f:
-                                results = json.load(f)
-                        
-                        # Count total games per opponent
-                        counts = {b: 0 for b in TARGET_BOTS}
-                        for r in results:
-                            opp = r.get('opponent')
-                            if opp in counts:
-                                counts[opp] += 1
-                        for g_id, g_data in bot.games.items():
-                            opp = g_data.get('opp_name')
-                            if opp in counts:
-                                counts[opp] += 1
-                                
-                        needed_opponents = [b for b, c in counts.items() if c < len(bot.profiles) * 2]
-                        
-                        if not needed_opponents:
-                            print("Tournament complete! All target match counts reached.")
-                            break
-                            
-                        opponent = random.choice(needed_opponents)
-                        print(f"Seeking: Challenging {opponent} (10+0)...")
-                        bot.client.challenges.create(opponent, rated=True, clock_limit=600, clock_increment=0)
-                    except Exception as e:
-                        print(f"Seek failed: {e}")
-                time.sleep(45) # Wait 45s between attempts
-        
-        t = threading.Thread(target=seeker, daemon=True)
-        t.start()
-        
+        bot.start_tournament_mode()
+
     bot.run()

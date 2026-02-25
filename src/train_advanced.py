@@ -1,502 +1,330 @@
 #!/usr/bin/env python3
-"""Production-Grade Training Script for ChessNet-3070.
-
-Designed for long-running sessions (12-48h) with maximum resilience.
-
-Usage
------
-    # Fresh training:
-    python src/train_advanced.py --data data/ --name baseline_v2
-
-    # Resume after interruption:
-    python src/train_advanced.py --data data/ --name baseline_v2 --resume
-
-Features
---------
-- **OneCycleLR** scheduler (max_lr=0.01, epochs=30).
-- **Early Stopping** (patience=5).
-- **Robust Checkpointing**: best_model.pt, checkpoint_last.pt, checkpoint_interrupted.pt.
-- **Auto-Resume**: --resume flag loads everything from checkpoint_last.pt.
-- **Ctrl+C Safety**: Saves checkpoint_interrupted.pt on KeyboardInterrupt.
-- **FP16 Mixed Precision** (torch.cuda.amp.GradScaler).
-- **High-Throughput DataLoader** (num_workers=8, pin_memory=True).
-- **Detailed Logging**: epoch progress, moving average loss, LR, ETA.
-"""
-
-from __future__ import annotations
-
 import argparse
 import json
+import logging
 import math
 import sys
 import time
-from datetime import datetime
+from datetime import timedelta
 from pathlib import Path
 
 import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset, Subset
+from torch.amp import GradScaler, autocast
 from tqdm import tqdm
 
+# Inject project root
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from config import ModelConfig, TrainConfig
-from src.model import ChessNet, build_model, count_params
+from config import ModelConfig
+from src.model import build_model, count_params
 
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s | %(levelname)s | %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S',
+    handlers=[logging.StreamHandler(sys.stdout)]
+)
+logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Dataset (Memmap + HDF5 Fallback)
-# ---------------------------------------------------------------------------
 
 class MemmapDataset(Dataset):
-    """Memory-mapped numpy dataset for instant random-access I/O."""
-
-    def __init__(self, data_dir: Path) -> None:
-        self._data_dir = data_dir
-        meta_path = data_dir / "meta.json"
-        if meta_path.exists():
-            with open(meta_path) as f:
-                self._len = json.load(f)["n_positions"]
+    """
+    High-performance dataset using memory-mapped Numpy arrays.
+    Allows instant access to 24M+ positions without loading RAM.
+    """
+    def __init__(self, data_dir: Path):
+        self.data_dir = data_dir
+        self.meta_path = data_dir / "meta.json"
+        
+        # Determine dataset length
+        if self.meta_path.exists():
+            with open(self.meta_path) as f:
+                self.length = json.load(f)["n_positions"]
         else:
-            arr = np.load(data_dir / "policies.npy", mmap_mode="r")
-            self._len = arr.shape[0]
-            del arr
-        self._states = None
-        self._policies = None
-        self._values = None
+            # Fallback: check file size directly
+            self.length = len(np.load(data_dir / "policies.npy", mmap_mode="r"))
 
-    def _ensure_open(self) -> None:
-        if self._states is None:
-            self._states = np.load(self._data_dir / "states.npy", mmap_mode="r")
-            self._policies = np.load(self._data_dir / "policies.npy", mmap_mode="r")
-            self._values = np.load(self._data_dir / "values.npy", mmap_mode="r")
+        # Lazy loading handles
+        self.states = None
+        self.policies = None
+        self.values = None
 
-    def __len__(self) -> int:
-        return self._len
+    def _init_memmaps(self):
+        if self.states is None:
+            self.states = np.load(self.data_dir / "states.npy", mmap_mode="r")
+            self.policies = np.load(self.data_dir / "policies.npy", mmap_mode="r")
+            self.values = np.load(self.data_dir / "values.npy", mmap_mode="r")
 
-    def __getitem__(self, idx: int):
-        self._ensure_open()
-        state = torch.from_numpy(self._states[idx].copy())
-        policy = torch.tensor(self._policies[idx], dtype=torch.long)
-        value = torch.tensor(self._values[idx], dtype=torch.float32)
+    def __len__(self):
+        return self.length
+
+    def __getitem__(self, idx):
+        self._init_memmaps()
+        # Copy ensures we get a writable tensor, avoiding negative stride issues
+        state = torch.from_numpy(self.states[idx].copy())
+        policy = torch.tensor(self.policies[idx], dtype=torch.long)
+        value = torch.tensor(self.values[idx], dtype=torch.float32)
         return state, policy, value
 
 
-# ---------------------------------------------------------------------------
-# Checkpointing
-# ---------------------------------------------------------------------------
+class HDF5Dataset(Dataset):
+    """Fallback dataset for raw HDF5 files (slower than memmap)."""
+    def __init__(self, path: Path):
+        import h5py
+        self.path = path
+        with h5py.File(path, "r") as f:
+            self.length = f["states"].shape[0]
+        self.file = None
 
-def _save_checkpoint(
-    path: Path,
-    epoch: int,
-    global_step: int,
-    model: nn.Module,
-    optimizer: torch.optim.Optimizer,
-    scheduler: torch.optim.lr_scheduler.LRScheduler,
-    scaler: torch.amp.GradScaler,
-    best_val_loss: float,
-    patience_counter: int,
-) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save({
-        "epoch": epoch,
-        "global_step": global_step,
-        "model_state_dict": model.state_dict(),
-        "optimizer_state_dict": optimizer.state_dict(),
-        "scheduler_state_dict": scheduler.state_dict(),
-        "scaler_state_dict": scaler.state_dict(),
-        "best_val_loss": best_val_loss,
-        "patience_counter": patience_counter,
-    }, path)
+    def __len__(self):
+        return self.length
+
+    def __getitem__(self, idx):
+        import h5py
+        if self.file is None:
+            self.file = h5py.File(self.path, "r")
+            
+        state = torch.from_numpy(self.file["states"][idx])
+        policy = torch.tensor(self.file["policies"][idx], dtype=torch.long)
+        value = torch.tensor(self.file["values"][idx], dtype=torch.float32)
+        return state, policy, value
 
 
-def _format_time(seconds: float) -> str:
-    h, rem = divmod(int(seconds), 3600)
-    m, s = divmod(rem, 60)
-    if h > 0:
-        return f"{h}h{m:02d}m"
-    if m > 0:
-        return f"{m}m{s:02d}s"
-    return f"{s}s"
+def save_checkpoint(state, filename):
+    torch.save(state, filename)
+    logger.info(f"Checkpoint saved: {filename}")
 
 
-# ---------------------------------------------------------------------------
-# Training / Validation Epoch
-# ---------------------------------------------------------------------------
-
-def _run_epoch(
-    model: ChessNet,
-    loader: DataLoader,
-    device: torch.device,
-    epoch: int,
-    num_epochs: int,
-    global_step: int,
-    policy_weight: float = 1.0,
-    value_weight: float = 1.0,
-    optimizer: torch.optim.Optimizer | None = None,
-    scheduler: torch.optim.lr_scheduler.LRScheduler | None = None,
-    scaler: torch.amp.GradScaler | None = None,
-) -> dict:
-    """Run one epoch (train or val). Returns metrics dict."""
-    is_train = optimizer is not None
-    model.train() if is_train else model.eval()
-    phase = "Train" if is_train else "  Val"
-
-    total_loss = 0.0
-    total_ploss = 0.0
-    total_vloss = 0.0
+def train_epoch(model, loader, optimizer, scheduler, scaler, device, epoch):
+    model.train()
+    
+    loss_meter = 0.0
+    policy_loss_meter = 0.0
+    value_loss_meter = 0.0
     correct = 0
-    total_samples = 0
-    n_batches = 0
-    # Moving average for display
-    ma_loss = 0.0
-    ma_alpha = 0.05  # Exponential moving average weight
+    total = 0
+    
+    p_criterion = nn.CrossEntropyLoss()
+    v_criterion = nn.MSELoss()
 
-    policy_criterion = nn.CrossEntropyLoss()
-    value_criterion = nn.MSELoss()
+    pbar = tqdm(loader, desc=f"Train Ep {epoch}", dynamic_ncols=True)
+    
+    for states, policies, values in pbar:
+        states = states.to(device, non_blocking=True)
+        policies = policies.to(device, non_blocking=True)
+        values = values.to(device, non_blocking=True).unsqueeze(1)
 
-    pbar = tqdm(
-        loader,
-        desc=f"  {phase} {epoch + 1}/{num_epochs}",
-        unit="batch",
-        leave=True,
-        dynamic_ncols=True,
-        bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}] {postfix}",
-    )
+        optimizer.zero_grad(set_to_none=True)
 
-    ctx = torch.no_grad() if not is_train else torch.enable_grad()
+        with autocast("cuda"):
+            pred_policies, pred_values = model(states)
+            
+            loss_p = p_criterion(pred_policies, policies)
+            loss_v = v_criterion(pred_values, values)
+            loss = loss_p + loss_v
 
-    with ctx:
-        for states, policies, values in pbar:
-            states = states.to(device, non_blocking=True)
-            policies = policies.to(device, non_blocking=True)
-            values = values.to(device, non_blocking=True).unsqueeze(1)
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
+        scheduler.step()
 
-            if is_train:
-                optimizer.zero_grad(set_to_none=True)
+        # Metrics
+        bs = states.size(0)
+        total += bs
+        correct += (pred_policies.argmax(dim=1) == policies).sum().item()
+        
+        loss_val = loss.item()
+        loss_meter += loss_val
+        policy_loss_meter += loss_p.item()
+        value_loss_meter += loss_v.item()
 
-            with torch.amp.autocast(device_type="cuda", enabled=device.type == "cuda"):
-                policy_logits, value_pred = model(states)
-                p_loss = policy_criterion(policy_logits, policies)
-                v_loss = value_criterion(value_pred, values)
-                loss = policy_weight * p_loss + value_weight * v_loss
+        # Update progress bar
+        pbar.set_postfix(loss=f"{loss_val:.4f}", lr=f"{scheduler.get_last_lr()[0]:.1e}")
 
-            if is_train:
-                scaler.scale(loss).backward()
-                scaler.step(optimizer)
-                scaler.update()
-                scheduler.step()
+    metrics = {
+        "loss": loss_meter / len(loader),
+        "acc": 100 * correct / total,
+        "p_loss": policy_loss_meter / len(loader),
+        "v_loss": value_loss_meter / len(loader)
+    }
+    return metrics
 
-            batch_loss = loss.item()
-            total_loss += batch_loss
-            total_ploss += p_loss.item()
-            total_vloss += v_loss.item()
-            n_batches += 1
-            total_samples += states.size(0)
-            correct += (policy_logits.argmax(dim=1) == policies).sum().item()
 
-            if is_train:
-                global_step += 1
+@torch.no_grad()
+def validate(model, loader, device):
+    model.eval()
+    
+    total_loss = 0.0
+    correct = 0
+    total = 0
+    
+    p_criterion = nn.CrossEntropyLoss()
+    v_criterion = nn.MSELoss()
 
-            # Exponential moving average for display
-            if n_batches == 1:
-                ma_loss = batch_loss
-            else:
-                ma_loss = (1 - ma_alpha) * ma_loss + ma_alpha * batch_loss
+    for states, policies, values in tqdm(loader, desc="Validating", leave=False):
+        states = states.to(device, non_blocking=True)
+        policies = policies.to(device, non_blocking=True)
+        values = values.to(device, non_blocking=True).unsqueeze(1)
 
-            acc = correct / total_samples * 100
-            postfix = f"ma_loss={ma_loss:.4f} acc={acc:.1f}%"
-            if is_train and scheduler is not None:
-                postfix += f" lr={scheduler.get_last_lr()[0]:.2e}"
-            pbar.set_postfix_str(postfix, refresh=False)
+        with autocast("cuda"):
+            pred_policies, pred_values = model(states)
+            loss = p_criterion(pred_policies, policies) + v_criterion(pred_values, values)
 
-    pbar.close()
-
-    avg_loss = total_loss / max(n_batches, 1)
-    avg_ploss = total_ploss / max(n_batches, 1)
-    avg_vloss = total_vloss / max(n_batches, 1)
-    accuracy = correct / max(total_samples, 1) * 100
+        total_loss += loss.item()
+        total += states.size(0)
+        correct += (pred_policies.argmax(dim=1) == policies).sum().item()
 
     return {
-        "loss": avg_loss,
-        "policy_loss": avg_ploss,
-        "value_loss": avg_vloss,
-        "accuracy": accuracy,
-        "global_step": global_step,
+        "loss": total_loss / len(loader),
+        "acc": 100 * correct / total
     }
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
-
-def main() -> None:
-    parser = argparse.ArgumentParser(description="ChessNet-3070 Advanced Training")
-    parser.add_argument("--data", type=Path, required=True,
-                        help="Directory with states.npy/policies.npy/values.npy (or .h5)")
-    parser.add_argument("--name", type=str, default="advanced",
-                        help="Experiment name (checkpoints → checkpoints/<name>/)")
-    parser.add_argument("--resume", action="store_true",
-                        help="Resume training from checkpoint_last.pt")
-    # Training hyperparams
-    parser.add_argument("--epochs", type=int, default=30, help="Max epochs (default: 30)")
-    parser.add_argument("--batch-size", type=int, default=1024, help="Batch size (default: 1024)")
-    parser.add_argument("--max-lr", type=float, default=0.01, help="OneCycleLR max_lr (default: 0.01)")
-    parser.add_argument("--patience", type=int, default=5, help="Early stopping patience (default: 5)")
-    parser.add_argument("--workers", type=int, default=8, help="DataLoader workers (default: 8)")
-    # Model overrides
-    parser.add_argument("--filters", type=int, default=None)
-    parser.add_argument("--blocks", type=int, default=None)
+def main():
+    parser = argparse.ArgumentParser(description="ChessNet Training Pipeline")
+    parser.add_argument("--data", type=Path, required=True, help="Path to data directory (memmap) or .h5 file")
+    parser.add_argument("--name", type=str, default="baseline", help="Experiment name")
+    parser.add_argument("--resume", action="store_true", help="Resume from last checkpoint")
+    parser.add_argument("--epochs", type=int, default=30)
+    parser.add_argument("--batch-size", type=int, default=512)
+    parser.add_argument("--max-lr", type=float, default=1e-2)
+    parser.add_argument("--workers", type=int, default=8)
     args = parser.parse_args()
 
-    # ── Config ──
-    model_cfg = ModelConfig()
-    if args.filters is not None:
-        model_cfg.num_filters = args.filters
-    if args.blocks is not None:
-        model_cfg.num_residual_blocks = args.blocks
-
-    exp_dir = Path("checkpoints") / args.name
-    exp_dir.mkdir(parents=True, exist_ok=True)
+    # Setup directories
+    checkpoint_dir = Path("checkpoints") / args.name
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    logger.info(f"Running on {device} | Experiment: {args.name}")
 
-    # ── Banner ──
-    print()
-    print("=" * 65)
-    print(f"  ♟  ChessNet-3070 Advanced Trainer — [{args.name}]")
-    print("=" * 65)
-    print(f"  Device          : {device}")
-    if device.type == "cuda":
-        print(f"  GPU             : {torch.cuda.get_device_name(0)}")
-        vram = torch.cuda.get_device_properties(0).total_mem / (1024**3)
-        print(f"  VRAM            : {vram:.1f} GB")
-
-    # ── Model ──
-    model = build_model(model_cfg).to(device)
-    n_params = count_params(model)
-    print(f"  Architecture    : {model_cfg.num_residual_blocks} blocks × {model_cfg.num_filters} filters")
-    print(f"  Parameters      : {n_params:,}")
-
-    # ── Data ──
-    if (args.data / "states.npy").exists():
+    # Initialize Dataset
+    if args.data.is_dir() and (args.data / "states.npy").exists():
+        logger.info(f"Loading MemmapDataset from {args.data}")
         dataset = MemmapDataset(args.data)
-        print(f"  Data format     : memmap (fast)")
+    elif args.data.suffix in ['.h5', '.hdf5']:
+        logger.info(f"Loading HDF5Dataset from {args.data}")
+        dataset = HDF5Dataset(args.data)
     else:
-        h5_candidates = list(args.data.glob("*.h5")) + list(args.data.glob("*.hdf5"))
-        if h5_candidates:
-            import h5py
+        logger.error("Invalid data path. Ensure convert_to_memmap.py was run.")
+        sys.exit(1)
 
-            class HDF5Dataset(Dataset):
-                def __init__(self, path: Path) -> None:
-                    self._path = path
-                    with h5py.File(path, "r") as f:
-                        self._len = f["states"].shape[0]
-                    self._file = None
-
-                def __len__(self) -> int:
-                    return self._len
-
-                def __getitem__(self, idx):
-                    if self._file is None:
-                        self._file = h5py.File(self._path, "r")
-                    state = torch.from_numpy(self._file["states"][idx].astype(np.float32))
-                    policy = torch.tensor(self._file["policies"][idx], dtype=torch.long)
-                    value = torch.tensor(self._file["values"][idx], dtype=torch.float32)
-                    return state, policy, value
-
-            dataset = HDF5Dataset(h5_candidates[0])
-            print(f"  Data format     : HDF5 (slow — run convert_to_memmap.py!)")
-        else:
-            print(f"\n❌ No data found in {args.data}!")
-            return
-
-    n_total = len(dataset)
-    val_split = 0.1
-    n_val = int(n_total * val_split)
-    n_train = n_total - n_val
-
+    # Split Train/Val (90/10)
+    total_len = len(dataset)
+    val_len = int(0.10 * total_len)
+    train_len = total_len - val_len
+    
+    # Deterministic split
     generator = torch.Generator().manual_seed(42)
-    indices = torch.randperm(n_total, generator=generator).tolist()
-    train_subset = Subset(dataset, indices[:n_train])
-    val_subset = Subset(dataset, indices[n_train:])
+    train_set, val_set = torch.utils.data.random_split(dataset, [train_len, val_len], generator=generator)
 
-    print(f"  Positions       : {n_total:,}")
-    print(f"  Train / Val     : {n_train:,} / {n_val:,}")
-    print(f"  Batch size      : {args.batch_size}")
-
-    num_workers = args.workers
     train_loader = DataLoader(
-        train_subset, batch_size=args.batch_size, shuffle=True,
-        num_workers=num_workers, pin_memory=True, drop_last=True,
-        persistent_workers=num_workers > 0,
-        prefetch_factor=4 if num_workers > 0 else None,
+        train_set, 
+        batch_size=args.batch_size, 
+        shuffle=True, 
+        num_workers=args.workers,
+        pin_memory=True,
+        persistent_workers=(args.workers > 0)
     )
+    
     val_loader = DataLoader(
-        val_subset, batch_size=args.batch_size, shuffle=False,
-        num_workers=num_workers, pin_memory=True, drop_last=False,
-        persistent_workers=num_workers > 0,
-        prefetch_factor=4 if num_workers > 0 else None,
+        val_set, 
+        batch_size=args.batch_size, 
+        shuffle=False, 
+        num_workers=args.workers, 
+        pin_memory=True
     )
 
-    steps_per_epoch = math.ceil(n_train / args.batch_size)
-    total_steps = steps_per_epoch * args.epochs
-    print(f"  Steps/epoch     : {steps_per_epoch}")
-    print(f"  Total steps     : {total_steps:,}")
+    logger.info(f"Train: {train_len:,} | Val: {val_len:,}")
 
-    # ── Optimizer / Scheduler / Scaler ──
-    optimizer = torch.optim.AdamW(
-        model.parameters(), lr=args.max_lr / 25,  # div_factor=25 is OneCycle default
-        weight_decay=1e-4,
-    )
+    # Model Setup
+    config = ModelConfig()
+    model = build_model(config).to(device)
+    logger.info(f"Model Parameters: {count_params(model):,}")
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.max_lr, weight_decay=1e-4)
+    scaler = GradScaler()
+    
+    total_steps = len(train_loader) * args.epochs
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
-        optimizer,
-        max_lr=args.max_lr,
+        optimizer, 
+        max_lr=args.max_lr, 
         total_steps=total_steps,
         pct_start=0.3,
-        anneal_strategy="cos",
-        div_factor=25.0,
-        final_div_factor=1e4,
+        div_factor=25.0
     )
-    scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda")
 
+    # State tracking
     start_epoch = 0
-    global_step = 0
-    best_val_loss = float("inf")
-    patience_counter = 0
+    best_loss = float('inf')
+    
+    # Resume Logic
+    last_ckpt_path = checkpoint_dir / "checkpoint_last.pt"
+    if args.resume and last_ckpt_path.exists():
+        logger.info(f"Resuming from {last_ckpt_path}")
+        ckpt = torch.load(last_ckpt_path, map_location=device)
+        model.load_state_dict(ckpt['model'])
+        optimizer.load_state_dict(ckpt['optimizer'])
+        scheduler.load_state_dict(ckpt['scheduler'])
+        scaler.load_state_dict(ckpt['scaler'])
+        start_epoch = ckpt['epoch'] + 1
+        best_loss = ckpt.get('best_loss', float('inf'))
 
-    # ── Auto-Resume ──
-    last_ckpt = exp_dir / "checkpoint_last.pt"
-    if args.resume or last_ckpt.exists():
-        resume_path = last_ckpt if last_ckpt.exists() else None
-        if resume_path is not None and resume_path.exists():
-            print(f"  Resuming from   : {resume_path}")
-            ckpt = torch.load(resume_path, map_location=device, weights_only=True)
-            model.load_state_dict(ckpt["model_state_dict"])
-            optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-            scheduler.load_state_dict(ckpt["scheduler_state_dict"])
-            scaler.load_state_dict(ckpt["scaler_state_dict"])
-            start_epoch = ckpt["epoch"] + 1
-            global_step = ckpt.get("global_step", start_epoch * steps_per_epoch)
-            best_val_loss = ckpt.get("best_val_loss", float("inf"))
-            patience_counter = ckpt.get("patience_counter", 0)
-            print(f"  Resumed epoch   : {start_epoch} (best_val_loss={best_val_loss:.4f})")
-        else:
-            print(f"  Resume          : no checkpoint found, starting fresh")
-    else:
-        print(f"  Starting fresh")
-
-    print(f"  Epochs          : {start_epoch} → {args.epochs}")
-    print(f"  Max LR          : {args.max_lr}")
-    print(f"  Early stopping  : patience={args.patience}")
-    print(f"  Workers         : {num_workers}")
-
-    # Save experiment config
-    exp_config = {
-        "model": {k: str(v) if isinstance(v, Path) else v for k, v in vars(model_cfg).items()},
-        "training": {
-            "epochs": args.epochs, "batch_size": args.batch_size,
-            "max_lr": args.max_lr, "patience": args.patience,
-            "workers": num_workers,
-        },
-    }
-    with open(exp_dir / "config.json", "w") as f:
-        json.dump(exp_config, f, indent=2)
-
-    print("=" * 65)
-    print("  Ctrl+C → saves checkpoint_interrupted.pt")
-    print("  --resume → loads checkpoint_last.pt")
-    print("=" * 65)
-    print()
-
-    # ── Training Loop (KeyboardInterrupt-safe) ──
-    training_start = time.perf_counter()
-    epoch_times = []
-
+    # Training Loop
     try:
         for epoch in range(start_epoch, args.epochs):
-            t0 = time.perf_counter()
-
-            # ── Train ──
-            train_metrics = _run_epoch(
-                model, train_loader, device,
-                epoch, args.epochs, global_step,
-                optimizer=optimizer, scheduler=scheduler, scaler=scaler,
+            start_time = time.time()
+            
+            # Train
+            t_metrics = train_epoch(model, train_loader, optimizer, scheduler, scaler, device, epoch + 1)
+            
+            # Validate
+            v_metrics = validate(model, val_loader, device)
+            
+            duration = str(timedelta(seconds=int(time.time() - start_time)))
+            
+            logger.info(
+                f"Ep {epoch+1}/{args.epochs} [{duration}] "
+                f"Train Loss: {t_metrics['loss']:.4f} (Acc: {t_metrics['acc']:.1f}%) | "
+                f"Val Loss: {v_metrics['loss']:.4f} (Acc: {v_metrics['acc']:.1f}%)"
             )
-            global_step = train_metrics["global_step"]
 
-            # ── Validate ──
-            val_metrics = _run_epoch(
-                model, val_loader, device,
-                epoch, args.epochs, global_step,
-            )
+            # Checkpointing
+            state = {
+                'epoch': epoch,
+                'model': model.state_dict(),
+                'optimizer': optimizer.state_dict(),
+                'scheduler': scheduler.state_dict(),
+                'scaler': scaler.state_dict(),
+                'best_loss': best_loss
+            }
+            
+            # Always save last
+            save_checkpoint(state, last_ckpt_path)
 
-            epoch_time = time.perf_counter() - t0
-            epoch_times.append(epoch_time)
-            total_elapsed = time.perf_counter() - training_start
-            avg_epoch_time = sum(epoch_times) / len(epoch_times)
-            epochs_remaining = args.epochs - epoch - 1
-            eta_total = avg_epoch_time * epochs_remaining
-
-            # ── Epoch Summary ──
-            improved = val_metrics["loss"] < best_val_loss
-            marker = " ★ NEW BEST" if improved else ""
-            now = datetime.now().strftime('%H:%M:%S')
-
-            print(f"\n{'─' * 65}")
-            print(f"  [{now}] Epoch {epoch + 1}/{args.epochs}  │  "
-                  f"T.loss={train_metrics['loss']:.4f}  V.loss={val_metrics['loss']:.4f}{marker}")
-            print(f"  T.acc={train_metrics['accuracy']:.1f}%  V.acc={val_metrics['accuracy']:.1f}%  │  "
-                  f"LR={scheduler.get_last_lr()[0]:.2e}")
-            print(f"  Epoch: {_format_time(epoch_time)}  │  "
-                  f"Elapsed: {_format_time(total_elapsed)}  │  "
-                  f"ETA: {_format_time(eta_total)}")
-            print(f"{'─' * 65}")
-
-            # ── Always save checkpoint_last.pt ──
-            _save_checkpoint(
-                exp_dir / "checkpoint_last.pt",
-                epoch, global_step, model, optimizer, scheduler, scaler,
-                best_val_loss if not improved else val_metrics["loss"],
-                patience_counter if not improved else 0,
-            )
-            print(f"  💾 checkpoint_last.pt saved")
-
-            # ── Best model ──
-            if improved:
-                best_val_loss = val_metrics["loss"]
-                patience_counter = 0
-                _save_checkpoint(
-                    exp_dir / "best_model.pt",
-                    epoch, global_step, model, optimizer, scheduler, scaler,
-                    best_val_loss, 0,
-                )
-                print(f"  🏆 best_model.pt saved (val_loss={best_val_loss:.4f})")
-            else:
-                patience_counter += 1
-                print(f"  ⏳ No improvement ({patience_counter}/{args.patience})")
-
-            # ── Early stopping ──
-            if patience_counter >= args.patience:
-                print(f"\n⛔ Early stopping! Val loss didn't improve for {args.patience} epochs.")
-                print(f"   Best model: {exp_dir / 'best_model.pt'} (val_loss={best_val_loss:.4f})")
-                break
-
-        else:
-            total_time = time.perf_counter() - training_start
-            print(f"\n✅ Training complete! Total time: {_format_time(total_time)}")
-            print(f"   Best val_loss: {best_val_loss:.4f}")
-            print(f"   Best model:    {exp_dir / 'best_model.pt'}")
+            # Save best
+            if v_metrics['loss'] < best_loss:
+                best_loss = v_metrics['loss']
+                state['best_loss'] = best_loss
+                save_checkpoint(state, checkpoint_dir / "best_model.pt")
+                logger.info(f"New best model! (Loss: {best_loss:.4f})")
 
     except KeyboardInterrupt:
-        print(f"\n\n⏸  KeyboardInterrupt received! Saving emergency checkpoint...")
-        _save_checkpoint(
-            exp_dir / "checkpoint_interrupted.pt",
-            epoch, global_step, model, optimizer, scheduler, scaler,
-            best_val_loss, patience_counter,
-        )
-        print(f"  💾 Saved → {exp_dir / 'checkpoint_interrupted.pt'}")
-        print(f"\n  To resume: python src/train_advanced.py --data {args.data} --name {args.name} --resume\n")
+        logger.warning("Training interrupted! Saving emergency checkpoint...")
+        state = {
+            'epoch': epoch,
+            'model': model.state_dict(),
+            'optimizer': optimizer.state_dict(),
+            'scheduler': scheduler.state_dict(),
+            'scaler': scaler.state_dict(),
+            'best_loss': best_loss
+        }
+        save_checkpoint(state, checkpoint_dir / "checkpoint_interrupted.pt")
+        sys.exit(0)
 
 
 if __name__ == "__main__":

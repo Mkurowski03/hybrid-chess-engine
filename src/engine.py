@@ -1,454 +1,378 @@
-"""Chess inference engine with Alpha-Beta search and opening-book support.
-
-The neural network provides two things:
-  1. **Policy head** → move ordering (search best candidates first)
-  2. **Value head**  → leaf-node evaluation (replaces hand-crafted eval)
-
-This hybrid approach turns raw pattern-matching into tactical awareness.
-
-Usage
------
->>> from src.engine import ChessEngine
->>> engine = ChessEngine("checkpoints/baseline/best.pt")
->>> board = chess.Board()
->>> move = engine.select_move(board)             # depth-3 alpha-beta
->>> move = engine.select_move(board, depth=0)     # raw policy (no search)
-"""
-
-from __future__ import annotations
-
+import logging
 import sys
-import time
 from pathlib import Path
-from typing import Optional
+from typing import Optional, List, Dict, Tuple, Union
 
 import chess
 import chess.polyglot
+import chess.syzygy
 import numpy as np
 import torch
 
-# Allow direct imports when run from project root.
+# Inject project root
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from config import ModelConfig
-from src.board_encoder import encode_board
+from src.board_encoder import encode_board, move_to_policy_index
 from src.model import ChessNet, build_model
 from src.mcts import MCTS
 
+# Configure logging
+logger = logging.getLogger(__name__)
 
-def _policy_index_to_move(index: int, turn: chess.Color) -> chess.Move:
-    """Decode a policy index (``from_sq * 64 + to_sq``) back to a ``chess.Move``."""
-    from_sq = index // 64
-    to_sq = index % 64
+
+def policy_index_to_move(index: int, turn: chess.Color) -> chess.Move:
+    """Decodes a policy index (0-4095) into a chess.Move."""
+    from_sq, to_sq = divmod(index, 64)
     if turn == chess.BLACK:
         from_sq = chess.square_mirror(from_sq)
         to_sq = chess.square_mirror(to_sq)
     return chess.Move(from_sq, to_sq)
 
 
-def _move_to_policy_index(move: chess.Move, turn: chess.Color) -> int:
-    """Encode a ``chess.Move`` into a policy index."""
-    from_sq = move.from_square
-    to_sq = move.to_square
-    if turn == chess.BLACK:
-        from_sq = chess.square_mirror(from_sq)
-        to_sq = chess.square_mirror(to_sq)
-    return from_sq * 64 + to_sq
-
-
 class ChessEngine:
-    """Neural-network chess engine with Alpha-Beta search.
-
-    Parameters
-    ----------
-    checkpoint_path : str | Path | None
-        Path to a saved ``.pt`` checkpoint.
-    book_path : str | Path | None
-        Path to a Polyglot ``.bin`` opening book.
-    device : str
-        ``"cuda"`` or ``"cpu"``.
-    model_cfg : ModelConfig | None
-        Override the default model architecture.
-    search_depth : int
-        Default search depth for ``select_move``.  0 = raw policy (no search).
+    """
+    Neural MCTS Chess Engine.
+    
+    Combines a Dual-Headed ResNet (Policy/Value) with Monte Carlo Tree Search,
+    Opening Books (Polyglot), and Endgame Tablebases (Syzygy).
     """
 
     def __init__(
         self,
-        checkpoint_path: str | Path | None = None,
-        book_path: str | Path | None = None,
+        checkpoint_path: Optional[Union[str, Path]] = None,
+        book_path: Optional[Union[str, Path]] = None,
+        syzygy_path: Optional[Union[str, Path]] = None,
         device: str = "cuda",
-        model_cfg: ModelConfig | None = None,
-        search_depth: int = 3,
-        syzygy_path: str | Path | None = None,
+        model_cfg: Optional[ModelConfig] = None,
     ) -> None:
         self.device = torch.device(device if torch.cuda.is_available() else "cpu")
-        self.default_depth = search_depth
         
-        # ---- Syzygy Tablebases ----
-        self.tablebase = None
-        if syzygy_path:
-             try:
-                 import chess.syzygy
-                 self.tablebase = chess.syzygy.open_tablebase(str(syzygy_path))
-                 print(f"Syzygy Tablebase loaded from {syzygy_path}")
-             except Exception as e:
-                 print(f"Warning: Could not open Syzygy at {syzygy_path}: {e}")
-
-        # ---- model ----
-        self.model: ChessNet = build_model(model_cfg)
-        if checkpoint_path is not None:
-            ckpt = torch.load(
-                checkpoint_path, map_location=self.device, weights_only=True,
-            )
-            state_dict = ckpt.get("model_state_dict", ckpt)
-            self.model.load_state_dict(state_dict)
+        # 1. Load Model
+        self.model = build_model(model_cfg)
+        if checkpoint_path:
+            self._load_checkpoint(Path(checkpoint_path))
+        
         self.model.to(self.device)
         self.model.eval()
 
-        # ---- opening book ----
-        self._book_path: Optional[Path] = None
-        if book_path is not None:
-            p = Path(book_path)
-            if p.is_file():
-                self._book_path = p
-
-        # ---- search stats (populated after each search) ----
-        self.last_search_nodes = 0
-        self.last_search_time = 0.0
-
-        # ---- transposition table (MCTS doesn't use this directly yet, or uses its own tree) ----
-        # We can remove self.tt if MCTS manages its own tree.
-        # But for now let's keep it if we want to add it back later.
-        # Actually MCTS builds a tree. We validly don't need TT hash map the same way.
-        self.tt = {} 
+        # 2. Load Resources
+        self.book_path = Path(book_path) if book_path else None
+        self.tablebase = self._init_tablebase(syzygy_path)
         
-        # ---- MCTS ----
+        # 3. Initialize MCTS (Stateless runner)
         self.mcts = MCTS(self.model, device=self.device, batch_size=8)
+        
+        logger.info(f"Engine initialized on {self.device}")
 
-    def clear_tt(self):
-        """Clear the MCTS tree (re-initialize)."""
-        self.mcts = MCTS(self.model, device=self.device, batch_size=8)
+    def _load_checkpoint(self, path: Path):
+        if not path.exists():
+            logger.warning(f"Checkpoint not found at {path}, using random weights.")
+            return
+        
+        try:
+            ckpt = torch.load(path, map_location=self.device, weights_only=True)
+            state_dict = ckpt.get("model_state_dict", ckpt)
+            self.model.load_state_dict(state_dict)
+            logger.info(f"Loaded checkpoint: {path.name}")
+        except Exception as e:
+            logger.error(f"Failed to load checkpoint: {e}")
 
-        # ---- search stats (populated after each search) ----
-        self.last_search_nodes = 0
-        self.last_search_time = 0.0
+    def _init_tablebase(self, path: Union[str, Path, None]):
+        if not path:
+            return None
+        try:
+            tb = chess.syzygy.open_tablebase(str(path))
+            logger.info(f"Syzygy tablebases active: {path}")
+            return tb
+        except Exception as e:
+            logger.warning(f"Syzygy init failed: {e}")
+            return None
 
-    # -----------------------------------------------------------------
-    # Public API
-    # -----------------------------------------------------------------
+    # -------------------------------------------------------------------------
+    # Core Decision Logic
+    # -------------------------------------------------------------------------
 
     def select_move(
-        self, board: chess.Board, depth: int | None = None, simulations: int = 800, **kwargs
+        self, 
+        board: chess.Board, 
+        depth: Optional[int] = None, 
+        simulations: int = 800, 
+        **kwargs
     ) -> chess.Move:
-        """Return the best move for the current position using MCTS.
-
-        1. Try the opening book first (instant).
-        2. If *depth* == 0, use raw policy argmax (instinct).
-        3. Otherwise, run MCTS search.
         """
-        book_move = self._try_book(board)
-        if book_move is not None:
-            return book_move
+        Determines the best move using the following priority pipeline:
+        1. Opening Book
+        2. Forced Mate Solver (DFS)
+        3. Syzygy Tablebases (Perfect Endgame)
+        4. Neural MCTS
+        """
+        # 1. Opening Book
+        if self.book_path:
+            book_move = self._get_book_move(board, kwargs.get("book_strategy", "weighted_random"))
+            if book_move:
+                return book_move
 
-        # If depth=0 is requested, skip MCTS
+        # 2. Raw Policy (Zero-shot)
         if depth == 0:
-            return self._nn_move(board)
-            
-        # Run MCTS
-        # We can map 'depth' to simulations if we want, but default 800 is good.
-        sims = simulations
-        if depth is not None and depth > 0:
-             # Heuristic: depth 1 -> 100, depth 3 -> 800, depth 5 -> 3000
-             if depth == 1: sims = 100
-             elif depth == 2: sims = 400
-             elif depth == 3: sims = 800
-             elif depth >= 4: sims = 2000
+            return self._get_raw_policy_move(board)
 
-        # Adaptive Endgame Boost (simulating "Math is Key")
-        # If pieces <= 12, the search space is smaller, so we can search much deeper.
-        # We boost simulations 3x and reduce exploration to focus on best lines.
-        cpuct = kwargs.get('cpuct', 2.0)
-        piece_count = len(board.piece_map())
-        if piece_count <= 12:
-            sims = int(sims * 3.0)
-            cpuct = kwargs.get('cpuct', 1.25)
-            
-        if sims > 5000: sims = 5000 # Safety cap
+        # 3. Forced Mate Guard (Avoids "Promotion Blindness")
+        # We search deeper if pieces are few (endgame).
+        mate_depth = 6 if len(board.piece_map()) <= 6 else 4
+        forced_mate = self._solve_forced_mate(board, depth=mate_depth)
+        if forced_mate:
+            logger.info(f"Mate Guard: Found forced mate in {mate_depth} plies.")
+            return forced_mate
 
-        # Create a fresh MCTS runner for this thread/search to prevent state races
-        mat_weight = kwargs.get('material_weight', 0.2)
-        disc = kwargs.get('discount', 0.90)
-        p_vals = kwargs.get('piece_values', None)
+        # 4. Syzygy Tablebase
+        # Standard TBs are 3-4-5 pieces.
+        if self.tablebase and len(board.piece_map()) <= 5:
+            tb_move = self._probe_syzygy(board)
+            if tb_move:
+                return tb_move
+
+        # 5. MCTS Search configuration
+        # Adaptive simulations based on game phase
+        eff_sims = simulations
         
-        mcts_runner = MCTS(self.model, self.device, cpuct=cpuct, material_weight=mat_weight, discount=disc, piece_values=p_vals)
-        self.mcts = mcts_runner # Save reference for checkmate extraction later
-
-        # 0. Forced Mate Check 
-        # Adaptive Depth: 4 normally, 6 if very few pieces (Mate in 3)
-        mate_depth = 4
-        if len(board.piece_map()) <= 6:
-            mate_depth = 6
+        # Endgame Turbo: If pieces <= 12, we can afford deeper search
+        if len(board.piece_map()) <= 12:
+            eff_sims = int(simulations * 3.0)
             
-        mate_move = self.find_mate_in_n(board, depth=mate_depth)
-        if mate_move:
-            print(f"Force-Mate found (depth={mate_depth}): {mate_move}")
-            return mate_move
+        # Hard cap for safety
+        eff_sims = min(eff_sims, 100_000)
 
-        # 0.5 Syzygy Tablebase Probe (Perfect Play)
-        if self.tablebase:
-            try:
-                # Only check if pieces match tablebase size (usually <= 5, maybe <= 6 if large TB)
-                if len(board.piece_map()) <= 5: # Assuming standard 3-4-5 TB
-                    best_tb_move = None
-                    best_tb_score = (-999, -99999) # maximize (-wdl, dtz)
+        # 6. Execute MCTS
+        return self._run_mcts(board, eff_sims, **kwargs)
 
-                    found_tb_move = False
-                    # Check all legal moves
-                    for move in board.legal_moves:
-                        board.push(move)
-                        try:
-                            # Probe opponent's perspective
-                            wdl = self.tablebase.probe_wdl(board)
-                            dtz = self.tablebase.probe_dtz(board)
-                            
-                            # DEBUG: Syzygy probe result
-                            # print(f"DEBUG: Syzygy probe result for {board.fen()}: wdl={wdl}, dtz={dtz}")
-                            
-                            score = (-wdl, dtz)
-                            if score > best_tb_score:
-                                best_tb_score = score
-                                best_tb_move = move
-                                
-                            found_tb_move = True
-                        except chess.syzygy.MissingTableError:
-                            pass
-                        finally:
-                            board.pop()
-                    
-                    if found_tb_move and best_tb_move:
-                        print(f"Syzygy Move: {best_tb_move} (WDL={best_tb_score[0]}, DTZ={best_tb_score[1]})")
-                        return best_tb_move
-            except Exception as e:
-                print(f"Syzygy Error: {e}")
-
-        # 1. Search (MCTS)
-        mcts_move = mcts_runner.search(board, num_simulations=sims)
+    def _run_mcts(self, board: chess.Board, sims: int, **kwargs) -> chess.Move:
+        # Re-initialize MCTS to ensure no state leakage between moves
+        self.mcts = MCTS(
+            self.model, 
+            self.device, 
+            cpuct=kwargs.get('cpuct', 2.0),
+            material_weight=kwargs.get('material_weight', 0.2),
+            discount=kwargs.get('discount', 0.90),
+            piece_values=kwargs.get('piece_values', None)
+        )
         
-        # 2. Winning Draw Rejection & Blunder Guard
-        # We look at candidate moves from MCTS and filter out draws/blunders
+        best_move = self.mcts.search(board, num_simulations=sims)
+
+        # Post-Search Safety: Check for Draw by Repetition in winning positions
         root = self.mcts.root
-        if root and root.Q > 0.1: # We think we are winning
-            candidates = sorted(root.children.items(), key=lambda x: x[1].N, reverse=True)
-            for move, node in candidates:
-                if node.N == 0: continue
+        if root and root.Q > 0.1: # If we think we are winning
+            best_move = self._filter_winning_draws(board, root)
+
+        return best_move
+
+    def _filter_winning_draws(self, board: chess.Board, root_node) -> chess.Move:
+        """
+        Prevents the engine from playing a move that claims a 3-fold repetition draw
+        when the engine evaluates the position as winning (> 0.1).
+        """
+        # Sort children by visit count
+        candidates = sorted(root_node.children.items(), key=lambda x: x[1].N, reverse=True)
+        
+        for move, node in candidates:
+            if node.N == 0: continue
+            
+            board.push(move)
+            is_draw = board.can_claim_draw() or board.is_stalemate()
+            is_blunder = self._is_immediate_blunder(board)
+            board.pop()
+            
+            if not is_draw and not is_blunder:
+                return move
                 
-                board.push(move)
-                is_draw = board.can_claim_draw()
-                is_blunder = self._is_immediate_blunder(board)
+        # If all moves are bad/draws, return the original best
+        return candidates[0][0]
+
+    # -------------------------------------------------------------------------
+    # Helpers: Syzygy, Book, Mate
+    # -------------------------------------------------------------------------
+
+    def _get_book_move(self, board: chess.Board, strategy: str) -> Optional[chess.Move]:
+        if not self.book_path: return None
+        try:
+            with chess.polyglot.open_reader(str(self.book_path)) as reader:
+                if strategy == "best":
+                    # Deterministic best move
+                    entry = reader.find(board)
+                    return entry.move
+                else:
+                    # Weighted random
+                    entry = reader.weighted_choice(board)
+                    return entry.move
+        except (IndexError, KeyError):
+            return None
+        except Exception:
+            return None
+
+    def _probe_syzygy(self, board: chess.Board) -> Optional[chess.Move]:
+        """
+        Probes WDL and DTZ tables. 
+        Prioritizes: Win > Draw > Loss. 
+        Tie-breaker: Minimize DTZ (for win), Maximize DTZ (for loss).
+        """
+        best_move = None
+        # Score format: (WDL, -DTZ) for wins, (WDL, DTZ) for defense
+        best_score = (-2, -9999) 
+
+        for move in board.legal_moves:
+            board.push(move)
+            try:
+                # Probe from opponent's perspective, so invert WDL
+                # WDL: 2=Win, 1=Win(50), 0=Draw, -1=Loss(50), -2=Loss
+                wdl = -self.tablebase.probe_wdl(board)
+                dtz = self.tablebase.probe_dtz(board)
+                
+                # Logic to strictly rank moves:
+                # 1. WDL (Win is best)
+                # 2. DTZ (Shortest win is best)
+                
+                # Normalize score for comparison
+                # We want to MAXIMIZE this score tuple
+                if wdl > 0:
+                    # Winning: prefer smaller DTZ (faster win) -> negate DTZ
+                    current_score = (wdl, -dtz)
+                elif wdl < 0:
+                    # Losing: prefer larger DTZ (delay loss) -> positive DTZ
+                    current_score = (wdl, dtz)
+                else:
+                    # Draw
+                    current_score = (wdl, 0)
+
+                if current_score > best_score:
+                    best_score = current_score
+                    best_move = move
+
+            except chess.syzygy.MissingTableError:
+                pass
+            finally:
                 board.pop()
-                
-                if not is_draw and not is_blunder:
-                    return move
-                    
-            # Fallback if all moves are filtered (this shouldn't happen unless we're forced into draw)
-            pass
+        
+        if best_move:
+            logger.info(f"Syzygy Probe: Selected {best_move} (Score={best_score})")
+            
+        return best_move
 
-        return mcts_move
+    def _solve_forced_mate(self, board: chess.Board, depth: int) -> Optional[chess.Move]:
+        """DFS to find a forced mate sequence within `depth` plies."""
+        # Simple iterative deepening wrapper could be added here, 
+        # but for small depths straight DFS is fine.
+        return self._dfs_mate(board, depth, is_root=True)
 
-    def find_mate_in_n(self, board, depth):
-        """
-        Simple DFS to find a forced mate within 'depth' plies.
-        Returns the winning Move or None.
-        """
+    def _dfs_mate(self, board: chess.Board, depth: int, is_root: bool = False) -> Optional[chess.Move]:
+        if depth <= 0: return None
+        
+        # 1. Our Turn: Find ONE move that guarantees mate
         for move in board.legal_moves:
             board.push(move)
             if board.is_checkmate():
                 board.pop()
                 return move
             
-            # If not immediate mate, check if this leads to forced mate
+            # If no immediate mate, verify if this move forces a mate deeper
             if depth > 1:
-                 # Opponent's turn: He will try to AVOID mate.
-                 # If ALL his moves lead to our mate, then it's a forced mate.
-                 opponent_survives = False
-                 if board.is_stalemate() or board.is_insufficient_material() or board.can_claim_draw():
-                     opponent_survives = True
-                 else:
-                     # Check all opponent moves
-                     for opp_move in board.legal_moves:
-                         board.push(opp_move)
-                         # Can we mate after this?
-                         # We need to find ONE move that mates
-                         can_mate_response = self._can_mate(board, depth - 2)
-                         board.pop()
-                         
-                         if not can_mate_response:
-                             opponent_survives = True
-                             break
-                 
-                 if not opponent_survives:
-                     board.pop()
-                     return move
+                # After we move, it's opponent's turn. 
+                # We need to ensure ALL of their replies lead to OUR mate.
+                opponent_escapes = False
+                
+                if board.is_game_over(): # Stalemate/Draw
+                    opponent_escapes = True
+                else:
+                    for reply in board.legal_moves:
+                        board.push(reply)
+                        can_still_mate = self._dfs_mate(board, depth - 2)
+                        board.pop()
+                        
+                        if not can_still_mate:
+                            opponent_escapes = True
+                            break
+                
+                board.pop()
+                if not opponent_escapes:
+                    return move # This move forces mate!
+            else:
+                board.pop()
 
-            board.pop()
         return None
 
-    def _can_mate(self, board, depth):
-        """Helper for find_mate_in_n (Recursive)"""
-        # Our turn. We need ONE move that leads to mate.
-        if depth <= 0:
-            return False
-            
-        for move in board.legal_moves:
-             board.push(move)
-             if board.is_checkmate():
-                 board.pop()
-                 return True
-             
-             # Opponent's turn logic (All moves must fail)
-             if depth > 1:
-                 opponent_survives = False
-                 if board.is_game_over(): # Draw?
-                     opponent_survives = True
-                 else:
-                     all_opp_moves_lead_to_mate = True
-                     for opp_move in board.legal_moves:
-                         board.push(opp_move)
-                         still_can_mate = self._can_mate(board, depth - 2)
-                         board.pop()
-                         if not still_can_mate:
-                             all_opp_moves_lead_to_mate = False
-                             break
-                     if not all_opp_moves_lead_to_mate:
-                         opponent_survives = True
-                 
-                 if not opponent_survives:
-                     board.pop()
-                     return True
-             
-             board.pop()
-        return False
-
     def _is_immediate_blunder(self, board: chess.Board) -> bool:
-        """Check if opponent has an immediate mate-in-1."""
-        for opp_move in board.legal_moves:
-            board.push(opp_move)
+        """Checks if the opponent has an immediate Mate-in-1 response."""
+        for move in board.legal_moves:
+            board.push(move)
             if board.is_checkmate():
                 board.pop()
                 return True
             board.pop()
         return False
 
+    # -------------------------------------------------------------------------
+    # Neural Inference
+    # -------------------------------------------------------------------------
+
+    @torch.inference_mode()
+    def _get_raw_policy_move(self, board: chess.Board) -> chess.Move:
+        """Selects move solely based on Policy Head probabilities."""
+        state = encode_board(board)
+        tensor = torch.from_numpy(state).unsqueeze(0).to(self.device)
+        
+        policy_logits, _ = self.model(tensor)
+        
+        # Mask illegal moves
+        logits = policy_logits.squeeze(0).cpu().numpy()
+        mask = np.full(logits.shape, -float('inf'))
+        
+        legal_indices = [
+            move_to_policy_index(m, board.turn) for m in board.legal_moves
+        ]
+        mask[legal_indices] = 0
+        
+        best_idx = np.argmax(logits + mask)
+        return policy_index_to_move(int(best_idx), board.turn)
+
+    @torch.inference_mode()
     def evaluate(self, board: chess.Board) -> float:
-        """Return the value-head evaluation in ``[-1, 1]`` for the side to move."""
-        return self._nn_evaluate(board)
-
-    @torch.no_grad()
-    def top_moves(self, board: chess.Board, n: int = 5, **kwargs) -> list[dict]:
-        """Return top-N legal moves with probabilities from the policy head."""
-        state = torch.from_numpy(encode_board(board)).unsqueeze(0).to(self.device)
-
-        if self.device.type == "cuda":
-            with torch.amp.autocast(device_type="cuda"):
-                policy_logits, _value = self.model(state)
-        else:
-            policy_logits, _value = self.model(state)
-
-        logits = policy_logits.squeeze(0).cpu().numpy()
-
-        legal_moves = []
-        for move in board.legal_moves:
-            idx = _move_to_policy_index(move, board.turn)
-            legal_moves.append((move, idx, logits[idx]))
-
-        if not legal_moves:
-            return []
-
-        # Softmax over legal moves only
-        raw = np.array([x[2] for x in legal_moves], dtype=np.float32)
-        raw -= raw.max()
-        exp = np.exp(raw)
-        probs = exp / exp.sum()
-
-        ranked = sorted(zip(legal_moves, probs), key=lambda x: -x[1])
-
-        result = []
-        for (move, _idx, _logit), prob in ranked[:n]:
-            result.append({
-                "move": move.uci(),
-                "san": board.san(move),
-                "prob": round(float(prob), 4),
-            })
-        return result
-
-    # -----------------------------------------------------------------
-    # Opening Book
-    # -----------------------------------------------------------------
-
-    def _try_book(self, board: chess.Board) -> Optional[chess.Move]:
-        if self._book_path is None:
-            return None
-        try:
-            with chess.polyglot.open_reader(str(self._book_path)) as reader:
-                entry = reader.weighted_choice(board)
-                return entry.move
-        except (IndexError, KeyError, Exception):
-            return None
-
-    # -----------------------------------------------------------------
-    # Raw NN inference (no search)
-    # -----------------------------------------------------------------
-
-    @torch.no_grad()
-    def _nn_move(self, board: chess.Board) -> chess.Move:
-        """Select a move using raw policy argmax (no search)."""
-        state = torch.from_numpy(encode_board(board)).unsqueeze(0).to(self.device)
-
-        if self.device.type == "cuda":
-            with torch.amp.autocast(device_type="cuda"):
-                policy_logits, _value = self.model(state)
-        else:
-            policy_logits, _value = self.model(state)
-
-        logits = policy_logits.squeeze(0).cpu().numpy()
-
-        legal_indices: list[int] = []
-        for move in board.legal_moves:
-            legal_indices.append(_move_to_policy_index(move, board.turn))
-
-        mask = np.full(4096, -1e9, dtype=np.float32)
-        for idx in legal_indices:
-            mask[idx] = 0.0
-        masked_logits = logits + mask
-
-        best_idx = int(np.argmax(masked_logits))
-        return _policy_index_to_move(best_idx, board.turn)
-
-    @torch.no_grad()
-    def _nn_evaluate(self, board: chess.Board) -> float:
-        """Value-head evaluation in [-1, 1] for side to move."""
-        state = torch.from_numpy(encode_board(board)).unsqueeze(0).to(self.device)
-        if self.device.type == "cuda":
-            with torch.amp.autocast(device_type="cuda"):
-                _policy, value = self.model(state)
-        else:
-            _policy, value = self.model(state)
+        """Returns Value Head evaluation [-1, 1]."""
+        state = encode_board(board)
+        tensor = torch.from_numpy(state).unsqueeze(0).to(self.device)
+        _, value = self.model(tensor)
         return float(value.item())
 
-    @torch.no_grad()
-    def _nn_policy_and_value(self, board: chess.Board) -> tuple[np.ndarray, float]:
-        """Single forward pass returning both policy logits and value."""
-        state = torch.from_numpy(encode_board(board)).unsqueeze(0).to(self.device)
-        if self.device.type == "cuda":
-            with torch.amp.autocast(device_type="cuda"):
-                policy_logits, value = self.model(state)
-        else:
-            policy_logits, value = self.model(state)
-        return policy_logits.squeeze(0).cpu().numpy(), float(value.item())
-
-    # -----------------------------------------------------------------
-    # MCTS (via imported module) - Legacy Alpha-Beta removed
-    # -----------------------------------------------------------------
-
-
+    @torch.inference_mode()
+    def get_top_moves_data(self, board: chess.Board, top_n: int = 5) -> List[dict]:
+        """Returns analytic data for the top N moves by raw policy."""
+        state = encode_board(board)
+        tensor = torch.from_numpy(state).unsqueeze(0).to(self.device)
+        
+        policy_logits, value = self.model(tensor)
+        logits = policy_logits.squeeze(0).cpu().numpy()
+        
+        # Softmax over legal moves
+        moves = []
+        for m in board.legal_moves:
+            idx = move_to_policy_index(m, board.turn)
+            moves.append((m, logits[idx]))
+            
+        if not moves: return []
+        
+        # Numerical stability softmax
+        scores = np.array([x[1] for x in moves])
+        scores -= scores.max()
+        probs = np.exp(scores) / np.sum(np.exp(scores))
+        
+        # Sort and Format
+        ranked = sorted(zip(moves, probs), key=lambda x: x[1], reverse=True)
+        
+        results = []
+        for ((move, _), prob) in ranked[:top_n]:
+            results.append({
+                "uci": move.uci(),
+                "san": board.san(move),
+                "prob": float(prob),
+                "value": float(value.item())
+            })
+            
+        return results

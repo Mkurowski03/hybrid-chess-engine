@@ -1,69 +1,148 @@
+#!/usr/bin/env python3
+"""
+PGN Tournament Statistics Parser.
+
+Analyzes PGN files to generate leaderboards and head-to-head records.
+Designed for memory efficiency using stream processing.
+"""
+
+import logging
 import re
-import os
+import sys
+from collections import defaultdict
+from pathlib import Path
+from typing import Dict, Tuple, Optional
 
-def parse_pgn(filename):
-    if not os.path.exists(filename):
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    datefmt='%H:%M:%S'
+)
+logger = logging.getLogger(__name__)
+
+
+class TournamentStats:
+    """Aggregates scores and statistics for a tournament."""
+    def __init__(self):
+        self.total_games = 0
+        self.scores: Dict[str, float] = defaultdict(float)
+        # H2H format: (PlayerA, PlayerB) -> {PlayerA: wins, PlayerB: wins, 'draws': draws}
+        self.h2h: Dict[Tuple[str, str], Dict[str, float]] = defaultdict(
+            lambda: defaultdict(float)
+        )
+
+    def update(self, white: str, black: str, result: str):
+        """Updates stats with a single game result."""
+        self.total_games += 1
+        
+        # Ensure players exist in score dict even if they have 0 points
+        if white not in self.scores: self.scores[white] = 0.0
+        if black not in self.scores: self.scores[black] = 0.0
+
+        # Sort pair for consistent H2H key
+        pair = tuple(sorted([white, black]))
+        
+        if result == '1-0':
+            self.scores[white] += 1.0
+            self.h2h[pair][white] += 1
+        elif result == '0-1':
+            self.scores[black] += 1.0
+            self.h2h[pair][black] += 1
+        elif result == '1/2-1/2':
+            self.scores[white] += 0.5
+            self.scores[black] += 0.5
+            self.h2h[pair]['draws'] += 1
+
+
+def parse_pgn(file_path: Path) -> Optional[TournamentStats]:
+    """
+    Parses a PGN file line-by-line to extract tournament statistics.
+    """
+    if not file_path.exists():
+        logger.warning(f"File not found: {file_path}")
         return None
-        
-    with open(filename, 'r') as f:
-        text = f.read()
 
-    whites = re.findall(r'\[White "(.*)"\]', text)
-    blacks = re.findall(r'\[Black "(.*)"\]', text)
-    results = re.findall(r'\[Result "(.*)"\]', text)
-
-    scores = {}
-    head_to_head = {}
-
-    for w, b, r in zip(whites, blacks, results):
-        if w not in scores: scores[w] = 0.0
-        if b not in scores: scores[b] = 0.0
-        
-        pair = tuple(sorted([w, b]))
-        if pair not in head_to_head:
-            head_to_head[pair] = {w: 0.0, b: 0.0, 'draws': 0}
-            
-        if r == '1-0':
-            scores[w] += 1.0
-            head_to_head[pair][w] += 1
-        elif r == '0-1':
-            scores[b] += 1.0
-            head_to_head[pair][b] += 1
-        elif r == '1/2-1/2':
-            scores[w] += 0.5
-            scores[b] += 0.5
-            head_to_head[pair]['draws'] += 1
-
-    return {'total': len(results), 'scores': scores, 'h2h': head_to_head}
-
-print("### 1. Initial 60-Game Gauntlet (3m + 2s)")
-res1 = parse_pgn('gauntlet_results.pgn')
-if res1:
-    print(f"**Total Games:** {res1['total']}\n")
-    print("**Standings:**")
-    for k, v in sorted(res1['scores'].items(), key=lambda x: x[1], reverse=True):
-        print(f"- **{k}**: {v} pts")
+    stats = TournamentStats()
     
-    print("\n**Head-to-Head Breakdown:**")
-    for pair, data in res1['h2h'].items():
-        w, b = pair
-        print(f"- {w} ({data[w]}) vs {b} ({data[b]}) | Draws: {data['draws']}")
-else:
-    print("No data found.\n")
+    # Pre-compile regex for performance
+    re_white = re.compile(r'^\[White "(.*)"\]')
+    re_black = re.compile(r'^\[Black "(.*)"\]')
+    re_result = re.compile(r'^\[Result "(.*)"\]')
 
-print("\n---\n")
+    current_white = None
+    current_black = None
 
-print("### 2. Tiebreaker Rematch (5m + 5s)")
-res2 = parse_pgn('replay_timeout_results.pgn')
-if res2:
-    print(f"**Total Games:** {res2['total']}\n")
+    try:
+        with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
+            for line in f:
+                line = line.strip()
+                
+                # State Machine: Accumulate headers -> Commit on Result
+                m_white = re_white.match(line)
+                if m_white:
+                    current_white = m_white.group(1)
+                    continue
+
+                m_black = re_black.match(line)
+                if m_black:
+                    current_black = m_black.group(1)
+                    continue
+
+                m_result = re_result.match(line)
+                if m_result:
+                    if current_white and current_black:
+                        stats.update(current_white, current_black, m_result.group(1))
+                    
+                    # Reset state
+                    current_white = None
+                    current_black = None
+
+    except Exception as e:
+        logger.error(f"Error parsing {file_path}: {e}")
+        return None
+
+    return stats
+
+
+def print_report(title: str, stats: Optional[TournamentStats]):
+    """Formats and prints the tournament report."""
+    print(f"\n### {title}")
+    
+    if not stats or stats.total_games == 0:
+        print("No data found.\n")
+        print("-" * 40)
+        return
+
+    print(f"**Total Games:** {stats.total_games}\n")
+    
     print("**Standings:**")
-    for k, v in sorted(res2['scores'].items(), key=lambda x: x[1], reverse=True):
-        print(f"- **{k}**: {v} pts")
-        
+    # Sort by score descending
+    ranking = sorted(stats.scores.items(), key=lambda x: x[1], reverse=True)
+    for player, score in ranking:
+        print(f"- **{player}**: {score} pts")
+
     print("\n**Head-to-Head Breakdown:**")
-    for pair, data in res2['h2h'].items():
-        w, b = pair
-        print(f"- {w} ({data[w]}) vs {b} ({data[b]}) | Draws: {data['draws']}")
-else:
-    print("No data found.")
+    for pair, data in stats.h2h.items():
+        p1, p2 = pair
+        # Default to 0 if key missing
+        s1 = int(data.get(p1, 0))
+        s2 = int(data.get(p2, 0))
+        d = int(data.get('draws', 0))
+        print(f"- {p1} ({s1}) vs {p2} ({s2}) | Draws: {d}")
+    
+    print("-" * 40)
+
+
+def main():
+    # 1. Initial Gauntlet
+    stats1 = parse_pgn(Path('gauntlet_results.pgn'))
+    print_report("1. Initial 60-Game Gauntlet (3m + 2s)", stats1)
+
+    # 2. Tiebreaker
+    stats2 = parse_pgn(Path('replay_timeout_results.pgn'))
+    print_report("2. Tiebreaker Rematch (5m + 5s)", stats2)
+
+
+if __name__ == "__main__":
+    main()

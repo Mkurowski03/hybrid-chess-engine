@@ -1,8 +1,11 @@
-"""Board encoder: chess.Board → (18, 8, 8) tensor via bitboard extraction.
+"""
+Board Encoding Module for ChessNet-3070.
 
-Uses python-chess bitboard internals for speed — no per-square iteration.
-Board is always rendered from the perspective of the side to move
-(flip + colour-swap when it is Black's turn).
+Converts a python-chess Board into an (18, 8, 8) float32 tensor
+with perspective-relative piece planes and auxiliary channels.
+
+Also provides the canonical ``move_to_policy_index`` mapping used by
+MCTS, the pure-Python engine, and the Hybrid Rust/Python engine.
 """
 
 from __future__ import annotations
@@ -10,130 +13,125 @@ from __future__ import annotations
 import chess
 import numpy as np
 
-
-# Piece ordering used in channels 0-5 (ours) and 6-11 (theirs).
-_PIECE_TYPES: list[int] = [
+# Constants for channel ordering
+# Channels 0-5: Our pieces
+# Channels 6-11: Their pieces
+PIECE_ORDER = [
     chess.PAWN,
     chess.KNIGHT,
     chess.BISHOP,
     chess.ROOK,
     chess.QUEEN,
-    chess.KING,
+    chess.KING
 ]
 
-# Pre-computed lookup: bit-index → (row, col) for an 8×8 board.
-# Bit 0 = a1 = (0,0), bit 63 = h8 = (7,7).
-_BIT_TO_ROW = np.zeros(64, dtype=np.intp)
-_BIT_TO_COL = np.zeros(64, dtype=np.intp)
-for _sq in range(64):
-    _BIT_TO_ROW[_sq] = _sq >> 3     # _sq // 8
-    _BIT_TO_COL[_sq] = _sq & 0x07   # _sq % 8
-
-
-def _bb_to_plane(bb: int) -> np.ndarray:
-    """Convert a 64-bit bitboard to an (8, 8) binary numpy array.
-
-    Uses ``numpy`` vectorised operations — no Python-level square loop.
+def get_bitboard_plane(mask: int) -> np.ndarray:
     """
-    if bb == 0:
-        return np.zeros((8, 8), dtype=np.float32)
-
-    # Extract set-bit indices.
-    indices = np.array(_extract_bits(bb), dtype=np.intp)
-    plane = np.zeros((8, 8), dtype=np.float32)
-    plane[_BIT_TO_ROW[indices], _BIT_TO_COL[indices]] = 1.0
-    return plane
-
-
-def _extract_bits(bb: int) -> list[int]:
-    """Return a list of set-bit positions in *bb* (LSB-first)."""
-    bits: list[int] = []
-    while bb:
-        lsb = bb & -bb          # isolate lowest set bit
-        bits.append(lsb.bit_length() - 1)
-        bb ^= lsb               # clear it
-    return bits
-
-
-def _flip_plane(plane: np.ndarray) -> np.ndarray:
-    """Flip an 8×8 plane vertically (rank mirror)."""
-    return plane[::-1, :]
+    Converts a bitmask integer into an 8x8 float32 plane.
+    """
+    plane = np.zeros(64, dtype=np.float32)
+    if mask:
+        # chess.SquareSet is the standard, readable way to iterate bits
+        for sq in chess.SquareSet(mask):
+            plane[sq] = 1.0
+    return plane.reshape(8, 8)
 
 
 def encode_board(board: chess.Board) -> np.ndarray:
-    """Encode a ``chess.Board`` as an ``(18, 8, 8)`` float32 array.
-
-    The encoding is **canonical**: the board is always viewed from the
-    perspective of the side to move.  When it is Black's turn the board
-    is flipped vertically and colours are swapped so that channels 0-5
-    always represent "our" pieces and 6-11 "their" pieces.
-
-    Channels
-    --------
-    0-5   : Our pieces (P, N, B, R, Q, K).
-    6-11  : Opponent's pieces (P, N, B, R, Q, K).
-    12    : Repetition count (0, 1, or 2 — normalised by dividing by 2).
-    13    : Our kingside castling right.
-    14    : Our queenside castling right.
-    15    : Their kingside castling right.
-    16    : Their queenside castling right.
-    17    : Fifty-move rule counter (normalised to [0, 1]).
     """
-    planes = np.zeros((18, 8, 8), dtype=np.float32)
-
-    us = board.turn           # True = WHITE, False = BLACK
+    Encodes a chess board into an (18, 8, 8) float32 tensor.
+    
+    Format:
+        Channels 0-5:   Our pieces (P, N, B, R, Q, K)
+        Channels 6-11:  Opponent pieces
+        Channel 12:     Repetition count (0.0, 0.5, 1.0)
+        Channel 13-16:  Castling rights (K_us, Q_us, K_them, Q_them)
+        Channel 17:     50-move rule (normalized)
+        
+    Orientation:
+        The board is always oriented from the perspective of the side to move.
+        If it's Black's turn, the board is flipped vertically.
+    """
+    # 1. Setup Perspective
+    us = board.turn
     them = not us
-    flip = us == chess.BLACK  # need to flip when Black is to move
+    
+    # We construct planes in the standard orientation first, then flip if necessary
+    planes = []
 
-    # ---- Piece planes (channels 0-11) ----
-    for idx, pt in enumerate(_PIECE_TYPES):
-        our_bb = board.pieces_mask(pt, us)
-        their_bb = board.pieces_mask(pt, them)
-        our_plane = _bb_to_plane(our_bb)
-        their_plane = _bb_to_plane(their_bb)
+    # 2. Piece Planes (0-11)
+    for color in [us, them]:
+        for piece_type in PIECE_ORDER:
+            mask = board.pieces_mask(piece_type, color)
+            plane = get_bitboard_plane(mask)
+            planes.append(plane)
 
-        if flip:
-            our_plane = _flip_plane(our_plane)
-            their_plane = _flip_plane(their_plane)
-
-        planes[idx] = our_plane
-        planes[idx + 6] = their_plane
-
-    # ---- Repetition plane (channel 12) ----
-    # python-chess exposes `board.is_repetition(count)`.
+    # 3. Aux Planes
+    
+    # Repetition (Channel 12)
+    # 3-fold is usually game over, so we care about 1 and 2 repetitions.
+    # Normalizing: 0 -> 0.0, 1 -> 0.5, 2 -> 1.0
     if board.is_repetition(3):
-        rep = 2
+        rep_val = 1.0
     elif board.is_repetition(2):
-        rep = 1
+        rep_val = 0.5
     else:
-        rep = 0
-    planes[12] = rep / 2.0
+        rep_val = 0.0
+    
+    planes.append(np.full((8, 8), rep_val, dtype=np.float32))
 
-    # ---- Castling rights (channels 13-16) ----
-    if us == chess.WHITE:
-        our_k = bool(board.castling_rights & chess.BB_H1)
-        our_q = bool(board.castling_rights & chess.BB_A1)
-        their_k = bool(board.castling_rights & chess.BB_H8)
-        their_q = bool(board.castling_rights & chess.BB_A8)
-    else:
-        our_k = bool(board.castling_rights & chess.BB_H8)
-        our_q = bool(board.castling_rights & chess.BB_A8)
-        their_k = bool(board.castling_rights & chess.BB_H1)
-        their_q = bool(board.castling_rights & chess.BB_A1)
+    # Castling Rights (Channels 13-16)
+    # Order: Our King, Our Queen, Their King, Their Queen
+    castling_values = [
+        board.has_kingside_castling_rights(us),
+        board.has_queenside_castling_rights(us),
+        board.has_kingside_castling_rights(them),
+        board.has_queenside_castling_rights(them)
+    ]
+    
+    for right in castling_values:
+        val = 1.0 if right else 0.0
+        planes.append(np.full((8, 8), val, dtype=np.float32))
 
-    planes[13] = float(our_k)
-    planes[14] = float(our_q)
-    planes[15] = float(their_k)
-    planes[16] = float(their_q)
+    # 50-Move Rule (Channel 17)
+    halfmove_val = min(board.halfmove_clock / 100.0, 1.0)
+    planes.append(np.full((8, 8), halfmove_val, dtype=np.float32))
 
-    # ---- Fifty-move counter (channel 17) ----
-    planes[17] = min(board.halfmove_clock / 100.0, 1.0)
+    # 4. Stack and Flip
+    tensor = np.stack(planes)  # Shape (18, 8, 8)
 
-    return planes
+    # If it is Black's turn, we flip the board vertically (Rank 1 becomes Rank 8)
+    # to maintain a "canonical" perspective for the neural network.
+    if us == chess.BLACK:
+        tensor = np.flip(tensor, axis=1)
+
+    return tensor.astype(np.float32)
 
 
-def encode_board_tensor(board: chess.Board) -> "torch.Tensor":  # noqa: F821
-    """Convenience wrapper returning a ``torch.Tensor`` on CPU."""
+def encode_board_tensor(board: chess.Board):
+    """
+    Wrapper to return a PyTorch tensor (CPU) directly.
+    """
     import torch
+    np_array = encode_board(board)
+    return torch.from_numpy(np_array)
 
-    return torch.from_numpy(encode_board(board))
+
+# ---------------------------------------------------------------------------
+# Move ↔ Policy Index Mapping
+# ---------------------------------------------------------------------------
+
+def move_to_policy_index(move: chess.Move, turn: chess.Color) -> int:
+    """Maps a chess move to the flat policy index (0-4095).
+
+    The encoding is ``from_sq * 64 + to_sq`` after mirroring squares
+    for Black so the neural network always sees a canonical orientation.
+    """
+    from_sq = move.from_square
+    to_sq = move.to_square
+
+    if turn == chess.BLACK:
+        from_sq = chess.square_mirror(from_sq)
+        to_sq = chess.square_mirror(to_sq)
+
+    return from_sq * 64 + to_sq

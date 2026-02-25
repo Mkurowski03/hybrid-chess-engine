@@ -1,99 +1,179 @@
+#!/usr/bin/env python3
+"""
+Tournament Results Analyzer.
+
+Parses 'tournament_results.json' to generate a performance report
+including Elo-adjusted metrics and detailed head-to-head records.
+"""
+
 import json
-import pandas as pd
+import logging
+import sys
 from collections import defaultdict
+from pathlib import Path
+from typing import List, Dict, Any, Optional
 
-with open('tournament_results.json', 'r') as f:
-    data = json.load(f)
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    datefmt='%H:%M:%S'
+)
+logger = logging.getLogger(__name__)
 
-# Filter out the aborted games from the crash earlier today
-valid_games = [g for g in data if g.get('status') != 'aborted']
+RESULTS_FILE = Path('tournament_results.json')
 
-print(f"Total valid games played so far: {len(valid_games)}\n")
 
-profile_stats = defaultdict(lambda: {'wins': 0, 'losses': 0, 'draws': 0, 'total': 0, 'opp_ratings': [], 'weighted_score': 0.0})
+def load_games(file_path: Path) -> List[Dict[str, Any]]:
+    """Loads and filters valid games from the JSON log."""
+    if not file_path.exists():
+        logger.error(f"Results file not found: {file_path}")
+        sys.exit(1)
 
-for g in valid_games:
-    profile = g.get('profile', 'Unknown')
-    outcome = g.get('outcome', 'unknown')
-    opp_rating = g.get('opponent_rating', 'Unknown')
-    
-    # Try to parse opponent rating
     try:
-        opp_rating_int = int(str(opp_rating).replace('?', ''))
-    except ValueError:
-        continue # Skip if no valid rating
+        with open(file_path, 'r') as f:
+            data = json.load(f)
         
-    if outcome in ['win', 'loss', 'draw']:
-        stats = profile_stats[profile]
-        stats['total'] += 1
-        stats['opp_ratings'].append(opp_rating_int)
-        if outcome == 'win':
-            stats['wins'] += 1
-            stats['weighted_score'] += opp_rating_int / 1500.0
-        elif outcome == 'loss':
-            stats['losses'] += 1
-        elif outcome == 'draw':
-            stats['draws'] += 1
-            stats['weighted_score'] += (opp_rating_int / 1500.0) * 0.5
-
-print("--- Profile Performance (Elo Adjusted) ---")
-print(f"{'Profile':<25} | {'Score':<5} | {'W.Score':<7} | {'Games':<5} | {'Avg Opp Elo':<11} | {'Est. Perf (TPR)':<15}")
-print("-" * 85)
-
-for profile, stats in profile_stats.items():
-    total = stats['total']
-    if total == 0:
-        continue
+        # Filter aborted/crashed games
+        valid_games = [g for g in data if g.get('status') != 'aborted']
+        logger.info(f"Loaded {len(valid_games)} valid games from {len(data)} entries.")
+        return valid_games
         
-    wins = stats['wins']
-    losses = stats['losses']
-    draws = stats['draws']
-    
-    score = wins + 0.5 * draws
-    score_pct = score / total
-    
-    avg_opp_elo = sum(stats['opp_ratings']) / total
-    
-    # Simple linear approximation for TPR (Tournament Performance Rating)
-    # TPR = Average_Opp_Rating + 400 * (Wins - Losses) / Total
-    # A more standard one is based on normal distribution, but the linear rule of thumb is fine for small samples
-    # Let's use the +400/-400 rule:
-    # Or, TPR = Average_Opp_Rating + 800 * (score_pct - 0.5)
-    
-    if score_pct == 1.0:
-        tpr = avg_opp_elo + 400
-    elif score_pct == 0.0:
-        tpr = avg_opp_elo - 400
-    else:
-        # FIDE formula approximation: dp = 800 * p - 400
-        dp = 800 * score_pct - 400
-        tpr = avg_opp_elo + dp
-        
-    w_score = stats['weighted_score']
-    print(f"{profile:<25} | {score}/{total:<3} | {w_score:<7.2f} | {total:<5} | {avg_opp_elo:<11.1f} | ~{tpr:.0f}")
+    except json.JSONDecodeError:
+        logger.error(f"Failed to decode JSON from {file_path}")
+        return []
+    except Exception as e:
+        logger.error(f"Unexpected error loading data: {e}")
+        return []
 
-print("\n--- Detailed Matchups (ordered by Opponent Elo) ---")
-matchups = defaultdict(lambda: defaultdict(lambda: {'win': 0, 'loss': 0, 'draw': 0, 'opp_rating': 0}))
 
-for g in valid_games:
-    profile = g.get('profile', 'Unknown')
-    opponent = g.get('opponent', 'Unknown')
-    opp_rating = g.get('opponent_rating', 'Unknown')
-    outcome = g.get('outcome', 'unknown')
-    
+def parse_rating(rating: Any) -> Optional[int]:
+    """Cleanly parses ratings like '1500?' or 1600."""
     try:
-        opp_rating_int = int(str(opp_rating).replace('?', ''))
-    except ValueError:
-        continue
-        
-    if outcome in ['win', 'loss', 'draw']:
-        key = f"{opponent}"
-        matchups[profile][key][outcome] += 1
-        matchups[profile][key]['opp_rating'] = opp_rating_int
+        return int(str(rating).replace('?', ''))
+    except (ValueError, TypeError):
+        return None
 
-for profile, opp_stats in profile_stats.items():
-    print(f"\n[{profile}]")
-    # Sort opponents by rating
-    sorted_opps = sorted(matchups[profile].items(), key=lambda x: x[1]['opp_rating'])
-    for opp, stats in sorted_opps:
-        print(f"  vs {opp} ({stats['opp_rating']}): {stats['win']}W - {stats['loss']}L - {stats['draw']}D")
+
+def calculate_statistics(games: List[Dict[str, Any]]) -> Dict[str, Dict]:
+    """Aggregates stats per profile."""
+    # Structure: profile -> {wins, losses, ...}
+    stats = defaultdict(lambda: {
+        'wins': 0, 'losses': 0, 'draws': 0, 
+        'total': 0, 'opp_ratings': [], 
+        'weighted_score': 0.0,
+        'matchups': defaultdict(lambda: {'w': 0, 'l': 0, 'd': 0, 'rating': 0})
+    })
+
+    for g in games:
+        profile = g.get('profile', 'Unknown')
+        outcome = g.get('outcome')
+        opponent = g.get('opponent', 'Unknown')
+        
+        # Parse rating
+        rating = parse_rating(g.get('opponent_rating'))
+        if rating is None:
+            continue
+
+        if outcome in ['win', 'loss', 'draw']:
+            s = stats[profile]
+            s['total'] += 1
+            s['opp_ratings'].append(rating)
+            
+            # Matchup tracking
+            s['matchups'][opponent]['rating'] = rating
+
+            # Scoring
+            # Weighted Score: Experimental metric rewarding wins against higher rated opponents
+            base_weight = rating / 1500.0
+
+            if outcome == 'win':
+                s['wins'] += 1
+                s['weighted_score'] += base_weight
+                s['matchups'][opponent]['w'] += 1
+            elif outcome == 'loss':
+                s['losses'] += 1
+                s['matchups'][opponent]['l'] += 1
+            elif outcome == 'draw':
+                s['draws'] += 1
+                s['weighted_score'] += base_weight * 0.5
+                s['matchups'][opponent]['d'] += 1
+
+    return stats
+
+
+def calculate_tpr(avg_rating: float, score_pct: float) -> int:
+    """
+    Calculates Tournament Performance Rating (TPR) using the linear approximation method.
+    Formula: TPR = Ra + dp
+    where dp = 800 * score_pct - 400
+    """
+    if score_pct >= 1.0:
+        return int(avg_rating + 400)
+    elif score_pct <= 0.0:
+        return int(avg_rating - 400)
+    
+    dp = 800 * score_pct - 400
+    return int(avg_rating + dp)
+
+
+def print_performance_table(stats: Dict[str, Dict]):
+    """Prints the main leaderboard."""
+    print("\n--- Profile Performance (Elo Adjusted) ---")
+    header = f"{'Profile':<25} | {'Score':<6} | {'W.Score':<7} | {'Gms':<5} | {'Avg Opp':<9} | {'Est. TPR':<10}"
+    print(header)
+    print("-" * len(header))
+
+    # Sort by raw score points (Wins + 0.5 * Draws)
+    sorted_profiles = sorted(
+        stats.items(), 
+        key=lambda item: item[1]['wins'] + 0.5 * item[1]['draws'], 
+        reverse=True
+    )
+
+    for profile, s in sorted_profiles:
+        if s['total'] == 0:
+            continue
+
+        score = s['wins'] + 0.5 * s['draws']
+        score_pct = score / s['total']
+        avg_opp_elo = sum(s['opp_ratings']) / s['total']
+        tpr = calculate_tpr(avg_opp_elo, score_pct)
+
+        print(f"{profile:<25} | {score}/{s['total']:<4} | {s['weighted_score']:<7.2f} | {s['total']:<5} | {avg_opp_elo:<9.1f} | ~{tpr:<10}")
+
+
+def print_detailed_matchups(stats: Dict[str, Dict]):
+    """Prints head-to-head records."""
+    print("\n--- Detailed Matchups (Ordered by Opponent Rating) ---")
+    
+    for profile, s in stats.items():
+        if s['total'] == 0: 
+            continue
+            
+        print(f"\n[{profile}]")
+        
+        # Sort opponents by their rating
+        opponents = sorted(
+            s['matchups'].items(), 
+            key=lambda x: x[1]['rating']
+        )
+        
+        for opp_name, m in opponents:
+            record = f"{m['w']}W - {m['l']}L - {m['d']}D"
+            print(f"  vs {opp_name:<20} ({m['rating']}): {record}")
+
+
+def main():
+    games = load_games(RESULTS_FILE)
+    if not games:
+        print("No valid games to analyze.")
+        return
+
+    stats = calculate_statistics(games)
+    print_performance_table(stats)
+    print_detailed_matchups(stats)
+
+
+if __name__ == "__main__":
+    main()

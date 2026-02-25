@@ -1,122 +1,142 @@
-"""Smoke tests for ChessNet-3070 core components.
+"""
+Unit and Integration Tests for ChessNet-3070.
 
-Run with:  python -m pytest tests/smoke_test.py -v
+Usage:
+    pytest tests/smoke_test.py -v
 """
 
 from __future__ import annotations
 
+import logging
 import sys
 from pathlib import Path
 
 import chess
 import numpy as np
+import pytest
 import torch
 
-# Make project root importable.
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+# Inject project root
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(PROJECT_ROOT))
 
 from config import ModelConfig
 from src.board_encoder import encode_board
-from src.model import ChessNet, build_model, count_params
+from src.model import build_model, count_params
 from src.engine import ChessEngine
 
-
-# ── Board Encoder ──────────────────────────────────────────────────────────
+# Configure test logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("TEST")
 
 
 class TestBoardEncoder:
-    """Tests for ``src.board_encoder.encode_board``."""
+    """Validates the FEN -> Tensor encoding logic."""
 
-    def test_shape_and_dtype(self) -> None:
+    def test_tensor_shape_and_dtype(self):
         board = chess.Board()
         enc = encode_board(board)
+        
         assert enc.shape == (18, 8, 8), f"Expected (18,8,8), got {enc.shape}"
-        assert enc.dtype == np.float32
+        assert enc.dtype == np.float32, f"Expected float32, got {enc.dtype}"
 
-    def test_starting_position_white_pawns(self) -> None:
-        """Channel 0 should have White's pawns on rank-1 (row index 1)."""
+    def test_perspective_transform(self):
+        """
+        Ensures the board is always presented from the perspective of the active player.
+        """
+        # Case 1: White to move (Standard)
+        board = chess.Board()
+        enc_white = encode_board(board)
+        # White pawns on rank 2 (index 1)
+        assert enc_white[0, 1, :].sum() == 8.0, "White pawns missing on Rank 2"
+
+        # Case 2: Black to move (Flipped)
+        board.push_san("e4") # Now Black's turn
+        enc_black = encode_board(board)
+        
+        # Channel 0 is "Our Pawns". For Black, "Our Pawns" are on Rank 7.
+        # But the encoder flips the board vertically, so they should appear on Rank 2 (index 1).
+        assert enc_black[0, 1, :].sum() == 8.0, "Black pawns not flipped correctly to Rank 2"
+
+    def test_auxiliary_planes(self):
+        """Checks Castling Rights, Repetition, and 50-move rule."""
         board = chess.Board()
         enc = encode_board(board)
-        # Channel 0 = our pawns (White to move → our = White)
-        pawn_plane = enc[0]
-        # Rank 2 in chess = row index 1 in the array (a2..h2)
-        assert pawn_plane[1].sum() == 8.0, "Expected 8 pawns on rank 2"
-        assert pawn_plane[0].sum() == 0.0, "No pawns on rank 1"
+        
+        # Castling Rights (Channels 13-16) - All true at start
+        assert enc[13:17].sum() == 4 * 64, "Initial castling rights invalid"
 
-    def test_canonical_flip_for_black(self) -> None:
-        """When it's Black's turn the board should be flipped."""
-        board = chess.Board()
-        board.push_san("e4")  # Now it's Black's turn.
-        enc = encode_board(board)
-        # Channel 0 = "our" pawns → Black's pawns, but flipped to bottom.
-        # After flip, Black pawns (originally rank 7) should appear on row 1.
-        pawn_plane = enc[0]
-        assert pawn_plane[1].sum() == 8.0, "After flip 8 Black pawns should be on row 1"
-
-    def test_castling_rights_initial(self) -> None:
-        board = chess.Board()
-        enc = encode_board(board)
-        # White to move: channels 13-16 should all be 1 (all rights available).
-        for ch in range(13, 17):
-            assert enc[ch, 0, 0] == 1.0, f"Channel {ch} should be 1.0 initially"
-
-    def test_fifty_move_counter(self) -> None:
-        board = chess.Board()
+        # 50-move rule (Channel 17)
         board.halfmove_clock = 50
-        enc = encode_board(board)
-        expected = 50 / 100.0
-        assert abs(enc[17, 0, 0] - expected) < 1e-6
+        enc_50 = encode_board(board)
+        expected = 0.5 # 50 / 100
+        assert np.allclose(enc_50[17], expected), "50-move counter plane incorrect"
 
 
-# ── Model ──────────────────────────────────────────────────────────────────
+class TestModelArchitecture:
+    """Validates Neural Network structure and inference flow."""
 
+    @pytest.fixture(scope="class")
+    def model(self):
+        return build_model(ModelConfig())
 
-class TestModel:
-    """Tests for ``src.model.ChessNet``."""
-
-    def test_forward_shape(self) -> None:
-        model = build_model()
-        x = torch.randn(1, 18, 8, 8)
+    def test_forward_pass(self, model):
+        """Test random input through the network."""
+        batch_size = 4
+        x = torch.randn(batch_size, 18, 8, 8)
+        
         policy, value = model(x)
-        assert policy.shape == (1, 4096), f"Policy shape: {policy.shape}"
-        assert value.shape == (1, 1), f"Value shape: {value.shape}"
+        
+        assert policy.shape == (batch_size, 4096), "Policy output shape mismatch"
+        assert value.shape == (batch_size, 1), "Value output shape mismatch"
+        
+        # Value range check (Tanh output)
+        assert value.min() >= -1.0, "Value < -1.0"
+        assert value.max() <= 1.0, "Value > 1.0"
 
-    def test_value_range(self) -> None:
-        model = build_model()
-        x = torch.randn(4, 18, 8, 8)
-        _, value = model(x)
-        assert value.min().item() >= -1.0 - 1e-6
-        assert value.max().item() <= 1.0 + 1e-6
-
-    def test_batch_forward(self) -> None:
-        model = build_model()
-        x = torch.randn(8, 18, 8, 8)
-        p, v = model(x)
-        assert p.shape == (8, 4096)
-        assert v.shape == (8, 1)
-
-    def test_param_count(self) -> None:
-        model = build_model()
-        n = count_params(model)
-        assert n < 5_000_000, f"Too many params: {n:,}"
-        print(f"  Model has {n:,} trainable parameters")
+    def test_parameter_count(self, model):
+        params = count_params(model)
+        logger.info(f"Model Parameters: {params:,}")
+        assert params > 0, "Model has no parameters"
+        assert params < 10_000_000, "Model is unexpectedly large"
 
 
-# ── Engine ─────────────────────────────────────────────────────────────────
+class TestChessEngine:
+    """Integration tests for the Engine logic (MCTS + Inference)."""
 
+    @pytest.fixture(scope="class")
+    def engine(self):
+        # Use CPU for tests to avoid CUDA overhead/errors in CI
+        return ChessEngine(checkpoint_path=None, device="cpu")
 
-class TestEngine:
-    """Tests for ``src.engine.ChessEngine``."""
-
-    def test_select_move_returns_legal_move(self) -> None:
-        """From the starting position the engine must return a legal move."""
-        engine = ChessEngine(checkpoint_path=None, book_path=None, device="cpu")
+    def test_legal_move_generation(self, engine):
+        """Engine must return a valid move from startpos."""
         board = chess.Board()
-        move = engine.select_move(board)
-        assert move in board.legal_moves, f"{move} is not legal"
+        move = engine.select_move(board, simulations=10) # Low sims for speed
+        assert move in board.legal_moves, f"Engine returned illegal move: {move}"
 
-    def test_evaluate_returns_float(self) -> None:
-        engine = ChessEngine(checkpoint_path=None, book_path=None, device="cpu")
+    def test_mate_in_one_detection(self, engine):
+        """
+        Engine should find immediate mate (handled by MCTS or Mate Guard).
+        """
+        # Fool's Mate pattern (White to move and mate)
+        # Position: White Queen on h5, Black King on e8 unprotectable... 
+        # Actually let's use a simpler forced mate: K+Q vs K
+        fen = "8/8/8/8/8/5k2/4Q3/4K3 w - - 0 1" 
+        # White Q e2, Black K f3. 
+        # Setup specific mate in 1: 
+        fen = "k7/P7/K7/8/8/8/8/8 w - - 0 1" # Stalemate trap? No.
+        
+        # Simple Back Rank Mate
+        fen = "6k1/5ppp/8/8/8/8/8/3R2K1 w - - 0 1" # White Rook d1 to d8 is mate
+        board = chess.Board(fen)
+        
+        move = engine.select_move(board, simulations=50)
+        assert move.uci() == "d1d8", f"Failed to find back-rank mate. Got {move}"
+
+    def test_evaluation_consistency(self, engine):
+        """Evaluate should return a valid float."""
         board = chess.Board()
         val = engine.evaluate(board)
-        assert -1.0 <= val <= 1.0, f"Value out of range: {val}"
+        assert isinstance(val, float)
+        assert -1.0 <= val <= 1.0

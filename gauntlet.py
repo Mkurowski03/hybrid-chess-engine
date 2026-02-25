@@ -1,123 +1,156 @@
+#!/usr/bin/env python3
+"""
+Automated Engine Tournament Runner.
+
+Orchestrates a round-robin tournament between the local HybridEngine
+and various skill levels of Stockfish using 'cutechess-cli'.
+"""
+
 import logging
-import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
 from typing import List, Optional
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    datefmt='%H:%M:%S'
+)
+logger = logging.getLogger(__name__)
 
-def find_executable(name: str, search_dirs: List[str]) -> Optional[str]:
-    """Find the path to an executable within the specified search directories.
+# --- Configuration -----------------------------------------------------------
+PROJECT_ROOT = Path(__file__).resolve().parent
+CUTECHESS_DIR = PROJECT_ROOT / "cutechess-1.4.0-win64"
 
-    Args:
-        name (str): Name of the executable.
-        search_dirs (List[str]): Base directories to search in.
+# Engine Settings
+HERO_NAME = "Hybrid_Beast_V2"
+HERO_CMD = PROJECT_ROOT / "run_hybrid_beast.bat"
 
-    Returns:
-        Optional[str]: Absolute path to the executable or None.
+# Tournament Settings
+TIME_CONTROL = "180+2.0"  # 3 minutes + 2s increment
+ROUNDS = 2                # Pairs of games (white/black)
+CONCURRENCY = 3           # Number of parallel games
+OUTPUT_FILE = "hybrid_beast_results.pgn"
+
+# Opponent Ladder (Stockfish Elo ratings)
+OPPONENT_LEVELS = [2100, 2300, 2500]
+# -----------------------------------------------------------------------------
+
+
+def find_binary(name: str, search_paths: List[Path]) -> Optional[Path]:
     """
-    for d in search_dirs:
-        path = os.path.join(d, name)
-        if os.path.exists(path):
-            return path
-        path_exe = path + ".exe"
-        if os.path.exists(path_exe):
-            return path_exe
+    Locates an executable by checking system PATH and specific directories.
+    """
+    # 1. Check system PATH
+    sys_path = shutil.which(name)
+    if sys_path:
+        return Path(sys_path)
+
+    # 2. Check explicit folders
+    exe_name = f"{name}.exe" if sys.platform == "win32" else name
+    for path in search_paths:
+        candidate = path / exe_name
+        if candidate.exists():
+            return candidate
+        
+        # Check without .exe extension just in case
+        candidate_no_ext = path / name
+        if candidate_no_ext.exists():
+            return candidate_no_ext
+
     return None
 
-def main() -> None:
-    """Run the engine tournament utilizing cutechess-cli."""
-    root_dir = os.path.abspath(os.path.dirname(__file__))
-    search_dirs = [
-        root_dir,
-        os.path.join(root_dir, "cutechess-1.4.0-win64")
-    ]
 
-    # Find executables
-    stockfish_path = find_executable("stockfish", search_dirs)
-    if not stockfish_path:
-        logging.error("Could not find stockfish or stockfish.exe in root or cutechess folders.")
-        sys.exit(1)
-        
-    cutechess_path = find_executable("cutechess-cli", search_dirs)
-    if not cutechess_path:
-        logging.error("Could not find cutechess-cli or cutechess-cli.exe in root or cutechess folders.")
+def run_tournament():
+    # 1. Locate Dependencies
+    logger.info("Locating executables...")
+    
+    cutechess = find_binary("cutechess-cli", [PROJECT_ROOT, CUTECHESS_DIR])
+    if not cutechess:
+        logger.critical("cutechess-cli not found. Please install it or place in project root.")
         sys.exit(1)
 
-    logging.info(f"Found Stockfish: {stockfish_path}")
-    logging.info(f"Found cutechess: {cutechess_path}")
+    stockfish = find_binary("stockfish", [PROJECT_ROOT, CUTECHESS_DIR])
+    if not stockfish:
+        logger.critical("Stockfish not found. Please download it to the project root.")
+        sys.exit(1)
 
-    # Define our engine configurations
-    hybrid_bat = os.path.join(root_dir, "run_hybrid_beast.bat")
-    
-    engines = [
-        f'-engine name="Hybrid_Beast_40k" cmd="{hybrid_bat}" proto=uci',
+    if not HERO_CMD.exists():
+        logger.critical(f"Hero engine script not found: {HERO_CMD}")
+        sys.exit(1)
+
+    logger.info(f"CuteChess: {cutechess}")
+    logger.info(f"Stockfish: {stockfish}")
+    logger.info(f"HybridEng: {HERO_CMD}")
+
+    # 2. Build Command Arguments (List format is safer than Shell=True)
+    # Common settings applied to all engines
+    cmd = [
+        str(cutechess),
+        "-concurrency", str(CONCURRENCY),
+        "-tournament", "round-robin",
+        "-rounds", str(ROUNDS),
+        "-repeat",          # Play each opening twice (flip colors)
+        "-recover",         # Restart engine if it crashes
+        "-pgnout", OUTPUT_FILE,
+        "-each",            # Apply following args to all engines
+        f"tc={TIME_CONTROL}",
+        "proto=uci"
     ]
 
-    # Define Stockfish opponent ladder
-    opponents = [
-        f'-engine name="Stockfish-2100" cmd="{stockfish_path}" proto=uci option.UCI_LimitStrength=true option.UCI_Elo=2100',
-        f'-engine name="Stockfish-2300" cmd="{stockfish_path}" proto=uci option.UCI_LimitStrength=true option.UCI_Elo=2300',
-        f'-engine name="Stockfish-2500" cmd="{stockfish_path}" proto=uci option.UCI_LimitStrength=true option.UCI_Elo=2500'
-    ]
+    # 3. Add Hero Engine
+    cmd.extend([
+        "-engine",
+        f"name={HERO_NAME}",
+        f"cmd={HERO_CMD}"
+    ])
 
-    # Tournament settings (Rapid time control)
-    time_control = "-each tc=180+2.0" # 3 mins + 2.0s increment
-    concurrency = "-concurrency 3"
-    rounds = "-rounds 2" # 2 matches with -repeat gives 4 games per pairing
-    
-    # cutechess-cli tournament flags:
-    # -recover: restart crashed engines
-    # -repeat: play each opening twice (once as white, once as black)
-    flags = "-tournament round-robin -recover -repeat -pgnout hybrid_beast_results.pgn"
+    # 4. Add Opponents
+    for elo in OPPONENT_LEVELS:
+        cmd.extend([
+            "-engine",
+            f"name=Stockfish-{elo}",
+            f"cmd={stockfish}",
+            "option.UCI_LimitStrength=true",
+            f"option.UCI_Elo={elo}"
+        ])
 
-    # Build the command string
-    cmd_parts = [cutechess_path] + time_control.split() + concurrency.split() + rounds.split()
-    
-    # We must properly split engine definition strings so subprocess understands them
-    # A cleaner way when using subprocess.Popen is to pass the whole string if shell=True
-    
-    tournament_cmd = f'"{cutechess_path}" {time_control} {concurrency} {rounds}'
-    for eg in engines:
-        tournament_cmd += f" {eg}"
-    for opp in opponents:
-        tournament_cmd += f" {opp}"
-    tournament_cmd += f" {flags}"
+    # 5. Execute
+    logger.info("-" * 50)
+    logger.info(f"Starting Tournament: {HERO_NAME} vs Stockfish ({OPPONENT_LEVELS})")
+    logger.info(f"Time Control: {TIME_CONTROL}")
+    logger.info("-" * 50)
 
-    logging.info(f"Executing Gauntlet Command: {tournament_cmd}")
-    logging.info("Tournament started! Live results will appear below...")
-
-    # Run the tournament and stream output
     try:
-        process = subprocess.Popen(
-            tournament_cmd, 
+        # Popen allows us to stream stdout line by line
+        with subprocess.Popen(
+            cmd, 
             stdout=subprocess.PIPE, 
             stderr=subprocess.STDOUT,
-            text=True,
+            text=True, 
             bufsize=1,
-            shell=True
-        )
-        
-        while True:
-            output = process.stdout.readline()
-            if output == '' and process.poll() is not None:
-                break
-            if output:
-                # Print output directly to our console
-                print(output.strip(), flush=True)
-                
-        return_code = process.poll()
-        if return_code == 0:
-            logging.info("Tournament Completed Successfully!")
-        else:
-            logging.error(f"Tournament exited with error code {return_code}")
+            shell=False # Safer, avoids quoting hell
+        ) as process:
             
+            # Stream output
+            for line in process.stdout:
+                print(line.strip())
+
+            return_code = process.wait()
+            
+            if return_code == 0:
+                logger.info("Tournament finished successfully.")
+            else:
+                logger.error(f"Tournament failed with exit code {return_code}")
+
     except KeyboardInterrupt:
-        logging.warning("Tournament interrupted by user.")
-        process.terminate()
+        logger.warning("Tournament interrupted by user.")
     except Exception as e:
-        logging.error(f"Error running tournament: {e}")
+        logger.exception("Unexpected error during execution")
+
 
 if __name__ == "__main__":
-    main()
+    run_tournament()

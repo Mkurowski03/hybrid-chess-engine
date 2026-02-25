@@ -1,10 +1,21 @@
-"""Hybrid Rust/Python Engine combining Rust MCTS with PyTorch."""
+"""
+Hybrid Chess Engine (Rust Core + Python Inference).
+
+This module bridges the high-performance Rust MCTS implementation with 
+PyTorch/ONNX neural inference. It handles:
+1. Game state management
+2. Time allocation strategy
+3. Knowledge injection (Books, Syzygy)
+4. Batch inference scheduling
+"""
+
+from __future__ import annotations
 
 import logging
 import sys
 import time
 from pathlib import Path
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Tuple
 
 import chess
 import chess.polyglot
@@ -12,93 +23,107 @@ import chess.syzygy
 import numpy as np
 import torch
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+# Inject project root for local imports
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(PROJECT_ROOT))
 
-from config import ModelConfig
-from src.board_encoder import encode_board
+from config import ModelConfig, SIMPLIFICATION_FACTOR, MIN_PRUNING_SIMS, SMART_PRUNING_FACTOR
+from src.board_encoder import encode_board, move_to_policy_index
 from src.model import ChessNet, build_model
 from src.neural_backend import NeuralBackend, PyTorchBackend, ONNXBackend
 
-def _move_to_policy_index(move: chess.Move, turn: chess.Color) -> int:
-    """Encode a ``chess.Move`` into a policy index."""
-    from_sq = move.from_square
-    to_sq = move.to_square
-    if turn == chess.BLACK:
-        from_sq = chess.square_mirror(from_sq)
-        to_sq = chess.square_mirror(to_sq)
-    return from_sq * 64 + to_sq
-
+# Attempt to load the compiled Rust extension
 try:
     import chess_engine_core
 except ImportError:
-    logging.error("chess_engine_core not found! Please build the rust extension first.")
+    logging.critical("CRITICAL: 'chess_engine_core' extension not found.")
+    logging.critical("Run 'maturin develop --release' to build the Rust core.")
     sys.exit(1)
 
 
+# Configure logging
+logger = logging.getLogger(__name__)
+
+
 class HybridEngine:
-    """Hybrid Rust/Python Engine combining Rust MCTS with PyTorch."""
+    """
+    Orchestrates the Hybrid Architecture:
+    - Rust: Heavy MCTS tree traversal, move generation, and leaf selection.
+    - Python: Neural Network inference (GPU), Time Management, and heuristics.
+    """
 
     def __init__(
         self,
-        checkpoint_path: str | Path | None = None,
+        checkpoint_path: Optional[str | Path] = None,
         device: str = "cuda",
         model_cfg: Optional[ModelConfig] = None,
-        book_path: str | Path | None = None,
+        book_path: Optional[str | Path] = None,
     ) -> None:
-        """Initialize the Hybrid Engine.
-
-        Args:
-            checkpoint_path (str | Path | None): Path to the PyTorch model checkpoint.
-            device (str): Device to use for inference (e.g., "cuda" or "cpu").
-            model_cfg (Optional[ModelConfig]): Configuration for the model.
-            book_path (str | Path | None): Path to a Polyglot opening book (.bin).
-        """
-        self.book_path = book_path
         self.device = torch.device(device if torch.cuda.is_available() else "cpu")
-        self.model_cfg = model_cfg
+        self.model_cfg = model_cfg or ModelConfig()
         
-        # ---- inference backend ----
-        cp = Path(checkpoint_path) if checkpoint_path else None
-        if cp is not None and cp.suffix == ".onnx":
-            self.backend: NeuralBackend = ONNXBackend(cp)
-            self.model = None  # Not needed for ONNX
-            logging.info(f"Using ONNX backend: {cp}")
+        # 1. Initialize Inference Backend
+        self.backend = self._init_backend(checkpoint_path)
+
+        # 2. Initialize Knowledge Bases
+        self.book_path = Path(book_path) if book_path else None
+        self.tablebase = self._init_tablebase()
+        
+        logger.info(f"HybridEngine initialized on {self.device}")
+
+    def _init_backend(self, checkpoint_path: Optional[str | Path]) -> NeuralBackend:
+        """Sets up PyTorch or ONNX backend based on file extension."""
+        if not checkpoint_path:
+            # Fallback for testing without weights
+            logger.warning("No checkpoint provided. Initializing random PyTorch model.")
+            model = build_model(self.model_cfg).to(self.device)
+            return PyTorchBackend(model, self.device)
+
+        path = Path(checkpoint_path)
+        if path.suffix == ".onnx":
+            logger.info(f"Backend: ONNX Runtime ({path.name})")
+            return ONNXBackend(path)
         else:
-            model: ChessNet = build_model(model_cfg)
-            if cp is not None:
-                ckpt = torch.load(
-                    str(cp), map_location=self.device, weights_only=True,
-                )
-                state_dict = ckpt.get("model_state_dict", ckpt)
-                model.load_state_dict(state_dict)
+            logger.info(f"Backend: PyTorch Native ({path.name})")
+            model = build_model(self.model_cfg)
+            
+            # Load weights safely
+            ckpt = torch.load(path, map_location=self.device, weights_only=True)
+            state_dict = ckpt.get("model_state_dict", ckpt)
+            model.load_state_dict(state_dict)
+            
+            # Optimization settings
             if self.device.type == "cuda":
                 model.half()
                 torch.backends.cudnn.benchmark = True
-                torch.backends.cudnn.deterministic = False
+                
             model.to(self.device)
             model.eval()
-            self.model = model
-            self.backend = PyTorchBackend(model, self.device)
-            logging.info(f"Using PyTorch backend: {cp}")
-        
-        # ---- syzygy ----
-        self.tablebase = None
-        if self.model_cfg and self.model_cfg.syzygy_path: # Use self.model_cfg
-            tb_path = Path(self.model_cfg.syzygy_path) # Use self.model_cfg
-            if tb_path.exists() and any(tb_path.iterdir()):
-                try:
-                    self.tablebase = chess.syzygy.open_tablebase(str(tb_path))
-                    logging.info(f"Syzygy tablebase loaded from {tb_path}")
-                except Exception as e:
-                    logging.warning(f"Could not load Syzygy: {e}")
+            return PyTorchBackend(model, self.device)
+
+    def _init_tablebase(self) -> Optional[chess.syzygy.Tablebase]:
+        """Loads Syzygy tablebases if configured."""
+        if not self.model_cfg.syzygy_path:
+            return None
+            
+        tb_path = Path(self.model_cfg.syzygy_path)
+        if tb_path.exists() and any(tb_path.iterdir()):
+            try:
+                tb = chess.syzygy.open_tablebase(str(tb_path))
+                logger.info(f"Syzygy active: {tb_path}")
+                return tb
+            except Exception as e:
+                logger.error(f"Syzygy load failed: {e}")
+        return None
+
+    # -------------------------------------------------------------------------
+    # Core Decision Logic
+    # -------------------------------------------------------------------------
 
     def select_move(
         self, 
         board: chess.Board, 
         sims: int = 600,
-        cpuct: float = 1.25,
-        material_weight: float = 0.15,
-        discount: float = 0.90,
         batch_size: int = 512,
         wtime: Optional[int] = None,
         btime: Optional[int] = None,
@@ -106,309 +131,284 @@ class HybridEngine:
         binc: int = 0,
         book_strategy: str = "best",
         search_context: Optional[Dict[str, Any]] = None,
+        **kwargs
     ) -> chess.Move:
-        """Select a move using Rust MCTS + PyTorch Network.
-
-        Args:
-            board (chess.Board): The current board state.
-            sims (int): Number of MCTS simulations. Default is 600.
-            cpuct (float): PUCT exploration constant. Default is 1.25.
-            material_weight (float): Material bias weight. Default is 0.15.
-            discount (float): Discount factor for delayed checkmates. Default is 0.90.
-            batch_size (int): Execution batch size. Default is 16.
-            wtime (Optional[int]): White time remaining in milliseconds.
-            btime (Optional[int]): Black time remaining in milliseconds.
-            winc (int): White increment per move in milliseconds.
-            binc (int): Black increment per move in milliseconds.
-            search_context: Dictionary tracking dynamic state like "stop_flag", "pondering".
-
-        Returns:
-            chess.Move: The selected best move.
         """
-        
-        # --- SAFETY OVERRIDE: HARDCODED MATE-IN-1 ---
+        Main entry point for move selection.
+        Pipeline: Mate Guard -> Book -> Syzygy -> MCTS.
+        """
+        # 1. Instant Mate Guard (1-ply)
+        mate = self._check_forced_mate(board)
+        if mate: return mate
+
+        # 2. Opening Book
+        book_move = self._probe_book(board, book_strategy)
+        if book_move: return book_move
+
+        # 3. Syzygy Root Probe
+        tb_move = self._probe_syzygy(board)
+        if tb_move: return tb_move
+
+        # 4. Time Management
+        target_sims, time_limit_ms = self._allocate_time(
+            board, sims, wtime, btime, winc, binc
+        )
+
+        # 5. Rust MCTS Execution
+        return self._run_mcts_loop(
+            board, 
+            target_sims, 
+            batch_size, 
+            time_limit_ms, 
+            search_context, 
+            **kwargs
+        )
+
+    # -------------------------------------------------------------------------
+    # Pipeline Components
+    # -------------------------------------------------------------------------
+
+    def _check_forced_mate(self, board: chess.Board) -> Optional[chess.Move]:
+        """Checks for an immediate Mate-in-1."""
         for move in board.legal_moves:
             board.push(move)
             if board.is_checkmate():
-                # print(f"DEBUG: Executing forced mate sequence: {move.uci()}")
                 board.pop()
                 return move
             board.pop()
-        # --------------------------------------------
-        
-        # --- OPENING BOOK SUPPORT ---
-        if self.book_path and Path(self.book_path).exists():
-            try:
-                with chess.polyglot.open_reader(self.book_path) as reader:
-                    if book_strategy == "best":
-                        best_entry = None
-                        for entry in reader.find_all(board):
-                            if best_entry is None or entry.weight > best_entry.weight:
-                                best_entry = entry
-                        if best_entry:
-                            logging.info(f"[BOOK] Found best move {best_entry.move.uci()} (weight: {best_entry.weight})")
-                            self.last_pv = [best_entry.move.uci()]
-                            return best_entry.move
-                    else:
-                        entry = reader.weighted_choice(board)
-                        if entry:
-                            logging.info(f"[BOOK] Found move {entry.move.uci()} (weight: {entry.weight})")
-                            self.last_pv = [entry.move.uci()]
-                            return entry.move
-            except IndexError:
-                pass
-            except Exception as e:
-                logging.warning(f"Error reading opening book: {e}")
-        # --------------------------------------------
-        
-        # --- SYZYGY ENDGAME ROOT PROBING ---
-        if self.tablebase is not None:
-            piece_count = len(board.piece_map())
-            if piece_count <= 5: # Assuming 5-piece tablebases are populated
+        return None
+
+    def _probe_book(self, board: chess.Board, strategy: str) -> Optional[chess.Move]:
+        """Queries the Polyglot opening book."""
+        if not self.book_path or not self.book_path.exists():
+            return None
+            
+        try:
+            with chess.polyglot.open_reader(self.book_path) as reader:
+                if strategy == "best":
+                    # Iterate to find max weight entry manually if needed, 
+                    # or use reader.find(board) which usually returns the first/best match.
+                    # Here we replicate the logic of finding the absolute max weight.
+                    best_entry = max(reader.find_all(board), key=lambda e: e.weight, default=None)
+                    if best_entry:
+                        logger.info(f"[BOOK] Best move: {best_entry.move.uci()} (W: {best_entry.weight})")
+                        return best_entry.move
+                else:
+                    entry = reader.weighted_choice(board)
+                    if entry:
+                        logger.info(f"[BOOK] Weighted move: {entry.move.uci()} (W: {entry.weight})")
+                        return entry.move
+        except Exception:
+            return None
+        return None
+
+    def _probe_syzygy(self, board: chess.Board) -> Optional[chess.Move]:
+        """Probes 5-piece Syzygy tablebases for perfect play."""
+        if self.tablebase is None or len(board.piece_map()) > 5:
+            return None
+
+        try:
+            # WDL: Win(+2), Win50(+1), Draw(0), Loss50(-1), Loss(-2)
+            wdl = self.tablebase.probe_wdl(board)
+            if wdl is None: return None
+
+            # Optimization: Just find any move that preserves the WDL optimality.
+            # A full implementation would optimize DTZ (Distance to Zero).
+            best_move = None
+            
+            # Simple heuristic: Prefer winning > drawing. 
+            # If winning, minimize DTZ. If losing, maximize DTZ.
+            best_dtz = 99999 if wdl > 0 else -99999
+            
+            for move in board.legal_moves:
+                board.push(move)
                 try:
-                    # DTZ (Distance To Zero) gives the optimal move to win/draw
-                    wdl = self.tablebase.probe_wdl(board)
-                    if wdl is not None:
-                        # Find the best move according to DTZ, which preserves perfect play
-                        best_move = None
-                        best_dtz = None
-                        
-                        # We want the lowest absolute DTZ for winning, highest for losing etc.
-                        # python-chess has a convenient probe_dtz
-                        
-                        # Just grab the first move that maintains the WDL or optimal DTZ
-                        for m in board.legal_moves:
-                            board.push(m)
-                            # After our move, it's opponents turn, so DTZ flips
-                            try:
-                                dtz = self.tablebase.probe_dtz(board)
-                                # WDL flips too (from opponents perspective)
-                                reply_wdl = self.tablebase.probe_wdl(board)
-                                board.pop()
-                                
-                                # Simplified logic: If we are winning (wdl > 0), we want the reply_wdl to be < 0 for opponent
-                                if wdl > 0 and reply_wdl < 0:
-                                    if best_dtz is None or dtz > best_dtz: # Negative DTZ is worse for opponent
-                                        best_dtz = dtz
-                                        best_move = m
-                                elif wdl == 0 and reply_wdl == 0:
-                                    best_move = m
-                                elif wdl < 0 and reply_wdl > 0:
-                                    # We are losing. Maximize DTZ to delay mate
-                                    if best_dtz is None or dtz > best_dtz:
-                                        best_dtz = dtz
-                                        best_move = m
-                            except:
-                                board.pop()
-                                
-                        if best_move:
-                            logging.info(f"[SYZYGY] Perfect endgame move found: {best_move.uci()} (WDL: {wdl})")
-                            self.last_pv = [best_move.uci()]
-                            return best_move
-                except chess.syzygy.MissingTableError:
-                    pass
-                except Exception as e:
-                    logging.warning(f"Syzygy probing error: {e}")
-        # --------------------------------------------
+                    res_wdl = -self.tablebase.probe_wdl(board) # Negate because opponent's turn
+                    res_dtz = self.tablebase.probe_dtz(board)
+                    
+                    # If this move preserves the optimal result
+                    if res_wdl == wdl:
+                        if wdl > 0:  # Winning — minimize DTZ (fastest win)
+                            if res_dtz < best_dtz:
+                                best_dtz = res_dtz
+                                best_move = move
+                        elif wdl < 0:  # Losing — just preserve WDL, pick first legal
+                            best_move = move
+                            break
+                        else:
+                            best_move = move
+                            break
+                except Exception:
+                    logger.exception(f"Syzygy child probe failed for {move.uci()}")
+                finally:
+                    board.pop()
+            
+            if best_move:
+                logger.info(f"[SYZYGY] Perfect move: {best_move.uci()} (WDL: {wdl})")
+                return best_move
 
-        legal = list(board.legal_moves)
-        if len(legal) == 1:
-            return legal[0]
+        except Exception as e:
+            logger.warning(f"Syzygy probe error: {e}")
+            
+        return None
 
-        # --- DYNAMIC TIME MANAGEMENT ---
-        start_time = time.time()
-        last_log_time = start_time
-        alloc_time_ms = None
-        safe_time_ms = None
-        
+    def _allocate_time(
+        self, board: chess.Board, sims: int, wtime: Optional[int], btime: Optional[int], winc: int, binc: int
+    ) -> Tuple[int, Optional[float]]:
+        """Calculates dynamic simulation cap and time limit based on clock state."""
         my_time = wtime if board.turn == chess.WHITE else btime
         my_inc = winc if board.turn == chess.WHITE else binc
 
-        if my_time is not None:
-            # Deep Thinker: Spend ~16.6% of remaining time per move (more aggressive)
-            alloc_time_ms = (my_time / 6.0) + (my_inc * 0.75)
-            safe_time_ms = my_time - 1000  # Leave absolute 1 second buffer
-            if safe_time_ms < 100:
-                safe_time_ms = 100 # absolute minimum allowed to think
+        if my_time is None:
+            return sims, None
 
-            # Scale down target sims based on estimated NPS (Assume 6500 conservative)
-            ESTIMATED_NPS = 6500
-            max_possible_sims = int((alloc_time_ms / 1000.0) * ESTIMATED_NPS)
-            
-            # Deep Thinker: Raised panic threshold to 15 seconds. Below that, cap to 5000 sims or lower
-            if my_time < 15000:
-                max_possible_sims = min(max_possible_sims, 5000)
-                max_possible_sims = min(max_possible_sims, int((safe_time_ms / 1000.0) * ESTIMATED_NPS))
-            
-            sims = max(batch_size, min(sims, max_possible_sims))
-            logging.info(f"Panic Mode: Time low! Capping sims to {sims}. alloc={alloc_time_ms:.1f}ms safe={safe_time_ms:.1f}ms")
-            # print(f"DEBUG TIME: my_time={my_time}ms, alloc={alloc_time_ms}ms, safe={safe_time_ms}ms. Targeting sims: {sims}")
-        # --------------------------------
+        # "Deep Thinker" Strategy: Aggressive usage (~16% of clock)
+        alloc_ms = (my_time / 6.0) + (my_inc * 0.75)
+        safe_ms = max(100, my_time - 1000) # Always leave 1s buffer
 
-        # Initialize Rust MCTS Tree
-        fen = board.fen()
+        # Hard limit based on safe time
+        limit_ms = min(alloc_ms, safe_ms)
+
+        # Dynamic Simulation Cap based on Estimated NPS
+        EST_NPS = 6500
+        max_sims_time = int((limit_ms / 1000.0) * EST_NPS)
         
-        # Pass syzygy path if available
-        tb_path_str = None
-        if self.tablebase is not None and self.model_cfg and self.model_cfg.syzygy_path:
-            tb_path_str = self.model_cfg.syzygy_path
+        # Panic Mode: If < 15s remaining, cap strict
+        if my_time < 15000:
+            target_sims = min(sims, 5000, max_sims_time)
+        else:
+            target_sims = min(sims, max_sims_time)
             
-        from config import SIMPLIFICATION_FACTOR
-        rust_mcts = chess_engine_core.RustMCTS(fen, cpuct, discount, tb_path_str, SIMPLIFICATION_FACTOR)
+        target_sims = max(target_sims, 100) # Minimum floor
+        
+        return target_sims, limit_ms
+
+    def _run_mcts_loop(
+        self,
+        board: chess.Board,
+        sims: int,
+        batch_size: int,
+        time_limit_ms: Optional[float],
+        context: Optional[Dict],
+        **kwargs
+    ) -> chess.Move:
+        """Executes the tight loop between Rust MCTS and Python Inference."""
+        
+        # Initialize Rust Core
+        tb_path = str(self.model_cfg.syzygy_path) if (self.tablebase and self.model_cfg.syzygy_path) else None
+        
+        rust_mcts = chess_engine_core.RustMCTS(
+            board.fen(),
+            kwargs.get("cpuct", 1.25),
+            kwargs.get("discount", 0.90),
+            tb_path,
+            SIMPLIFICATION_FACTOR
+        )
 
         current_sims = 0
+        start_time = time.time()
+        last_log = start_time
         
+        # --- The Hot Loop ---
         while current_sims < sims:
-            # 1. Rust finds leaves to evaluate
-            # tensors is a list of 3D numpy arrays, node_ids is a list of ints
-            tensors, node_ids = rust_mcts.select_leaves(batch_size) 
+            # 1. Rust: Traverse tree and collect leaves
+            tensors, node_ids = rust_mcts.select_leaves(batch_size)
             
-            if not node_ids: 
-                break # Tree fully explored or game over
-                
+            if not node_ids:
+                break # Search exhausted
+            
             batch_len = len(node_ids)
+
+            # 2. Python/GPU: Batch Inference
+            # Stack into (B, 18, 8, 8)
+            states = np.stack(tensors) 
+            policy, value = self.backend.predict(states)
+            
+            # 3. Rust: Backpropagation
+            # We convert to list to cross FFI boundary safely
+            rust_mcts.backpropagate(node_ids, value.tolist(), policy.tolist())
+            
             current_sims += batch_len
 
-
-
-            # 2. Neural Backend evaluates on GPU (PyTorch or ONNX)
-            states_np = np.stack(tensors)
-            policy_np, value_np = self.backend.predict(states_np)
-            
-            # --- SYZYGY MCTS LEAF OVERRIDE ---
-            if self.tablebase is not None:
-                for idx, node_id in enumerate(node_ids):
-                    # We need the FEN or board to probe. 
-                    # Optimization Note: Reconstructing the board from Rust node is expensive in Python.
-                    # Since this runs inside the hot loop, a pure Python override is too slow (re-parsing FENs).
-                    # For phase 1, we rely solely on Root Probing (implemented above), which already catches
-                    # 5-piece endgames at the start of the turn instantly. 
-                    # To do leaf-probing efficiently, it MUST be implemented in Rust via shakmaty-syzygy.
-                    pass
-            # ---------------------------------
-            
-            # Blend Master Material Weight into Value
-            # HybridEngine delegates exact board construction to Rust, but we can approximate material or apply it on Python side if needed.
-            # For simplicity and extreme speed, we use pure NN value here, or build a fast material evaluator.
-            # We'll stick to pure NN value for Phase 3 baseline testing.
-
-            # Convert to lists for PyO3 boundary (Rust expects Vec<f32> and Vec<Vec<f32>>)
-            # Note: PyO3 can be made to accept numpy arrays directly for massive speedup, but list works for MVP.
-            val_list = value_np.tolist()
-            pol_list = policy_np.tolist()
-
-            # 3. Rust updates the tree
-            rust_mcts.backpropagate(node_ids, val_list, pol_list)
-            
-            # --- PERIODIC CHECKS (TIME, PRUNING, LOGGING) ---
-            # To eliminate CPU overhead, only query the system clock every ~4096 nodes
+            # 4. Periodic Checks (Every ~4k nodes to save CPU)
             if current_sims % 4096 < batch_len:
-                # 1. Emergency Time Check
-                if search_context and search_context.get("stop_flag"):
-                    logging.info("Forced stop received.")
+                if self._check_interrupts(context, start_time, time_limit_ms):
                     break
-
-                is_pondering = search_context and search_context.get("pondering", False)
-                if not is_pondering and alloc_time_ms is not None:
-                    effective_start = search_context.get("ponderhit_time", start_time) if search_context else start_time
-                    elapsed_ms_check = (time.time() - effective_start) * 1000.0
-                    if elapsed_ms_check > alloc_time_ms or elapsed_ms_check > safe_time_ms:
-                        break
-                        
-                # 2. Smart Pruning / Early Stopping
-                from config import MIN_PRUNING_SIMS, SMART_PRUNING_FACTOR
-                if current_sims >= MIN_PRUNING_SIMS:
+                
+                # Smart Pruning
+                if current_sims > MIN_PRUNING_SIMS:
                     v1, v2 = rust_mcts.top_two_visits()
                     if v1 > SMART_PRUNING_FACTOR * max(v2, 1):
-                        logging.info(f"[SMART PRUNING] Dominant move found (Visits: {v1} vs {v2}). Stopping early at {current_sims} sims.")
+                        logger.info(f"[PRUNING] Dominant move {v1} vs {v2}")
                         break
 
-                # 3. Live Logging (Silent Mode)
-                curr_time = time.time()
-                if curr_time - last_log_time >= 1.0:
-                    temp_best = rust_mcts.best_move()
-                    elapsed_ms_log = int((curr_time - start_time) * 1000)
-                    nps = int(current_sims / ((curr_time - start_time) + 1e-6))
-                    info_str = f"info depth {current_sims} score cp 0 time {elapsed_ms_log} nodes {current_sims} nps {nps} pv {temp_best}"
-                    print(info_str)
-                    sys.stdout.flush()
-                    last_log_time = curr_time
-            # ------------------------------------------------
-            
+                # UCI Logging
+                if time.time() - last_log > 1.0:
+                    self._log_uci_info(rust_mcts, current_sims, start_time)
+                    last_log = time.time()
+
+        # Finalize
         best_uci = rust_mcts.best_move()
-        self.last_pv = rust_mcts.principal_variation()
+        self._log_final_stats(best_uci, current_sims, start_time)
         
-        # Log final stats
-        final_time = time.time()
-        final_elapsed = final_time - start_time
-        final_nps = int(current_sims / (final_elapsed + 1e-6))
-        logging.info(f"[DONE] Move: {best_uci} | PV: {' '.join(self.last_pv)} | Sims: {current_sims} | Time Used: {final_elapsed:.2f}s | NPS: {final_nps}")
-        
-        try:
-            return chess.Move.from_uci(best_uci)
-        except ValueError:
-            # Fallback if tree fails
-            return legal[0]
+        return chess.Move.from_uci(best_uci)
+
+    def _check_interrupts(self, context: Optional[Dict], start_time: float, limit_ms: Optional[float]) -> bool:
+        """Returns True if search should stop."""
+        if context and context.get("stop_flag"):
+            return True
+            
+        if limit_ms:
+            elapsed = (time.time() - start_time) * 1000
+            if elapsed > limit_ms:
+                return True
+        return False
+
+    def _log_uci_info(self, mcts, sims, start):
+        elapsed = int((time.time() - start) * 1000)
+        nps = int(sims / ((time.time() - start) + 1e-6))
+        pv = mcts.best_move()
+        print(f"info depth {sims // 100} time {elapsed} nodes {sims} nps {nps} pv {pv}")
+        sys.stdout.flush()
+
+    def _log_final_stats(self, move, sims, start):
+        elapsed = time.time() - start
+        nps = int(sims / (elapsed + 1e-6))
+        logger.info(f"[SEARCH] Best: {move} | Sims: {sims} | Time: {elapsed:.2f}s | NPS: {nps}")
+
+    # -------------------------------------------------------------------------
+    # Inference Helpers
+    # -------------------------------------------------------------------------
 
     def evaluate(self, board: chess.Board) -> float:
-        """Return the value-head evaluation in ``[-1, 1]`` for the side to move.
-
-        Args:
-            board (chess.Board): The current board state.
-
-        Returns:
-            float: Evaluation score from -1.0 to 1.0.
-        """
-        state = torch.from_numpy(encode_board(board)).unsqueeze(0).to(self.device)
-        if self.device.type == "cuda":
-            state = state.half()
-            
-        with torch.inference_mode():
-            _policy, value = self.model(state)
-        return float(value.item())
+        """Zero-shot value head evaluation."""
+        state = encode_board(board)[np.newaxis, ...] # Add batch dim
+        _, value = self.backend.predict(state)
+        return float(value[0])
 
     @torch.no_grad()
-    def top_moves(self, board: chess.Board, n: int = 5, **kwargs: Any) -> list[dict]:
-        """Return top-N candidate moves with probabilities from the policy head.
-
-        Args:
-            board (chess.Board): The current board state.
-            n (int): Number of top moves to return.
-            kwargs (Any): Additional keyword arguments.
-
-        Returns:
-            list[dict]: List of dictionaries containing top moves and probabilities.
-        """
-        state = torch.from_numpy(encode_board(board)).unsqueeze(0).to(self.device)
-        if self.device.type == "cuda":
-            state = state.half()
-
-        with torch.inference_mode():
-            policy_logits, _value = self.model(state)
-
-        logits = policy_logits.squeeze(0).float().cpu().numpy()
-
+    def top_moves(self, board: chess.Board, n: int = 5) -> List[Dict]:
+        """Zero-shot policy analysis."""
+        state = encode_board(board)[np.newaxis, ...]
+        policy, _ = self.backend.predict(state)
+        
+        logits = policy[0]
         legal_moves = []
+        
         for move in board.legal_moves:
-            idx = _move_to_policy_index(move, board.turn)
-            legal_moves.append((move, idx, logits[idx]))
-
-        if not legal_moves:
-            return []
-
-        # Softmax over legal moves only
-        raw = np.array([x[2] for x in legal_moves], dtype=np.float32)
-        raw -= raw.max()
-        exp = np.exp(raw)
-        probs = exp / exp.sum()
-
-        ranked = sorted(zip(legal_moves, probs), key=lambda x: -x[1])
-
-        result = []
-        for (move, _idx, _logit), prob in ranked[:n]:
-            result.append({
-                "move": move.uci(),
-                "san": board.san(move),
-                "prob": round(float(prob), 4),
-            })
-        return result
+            idx = move_to_policy_index(move, board.turn)
+            legal_moves.append((move, logits[idx]))
+            
+        # Softmax
+        if not legal_moves: return []
+        
+        scores = np.array([x[1] for x in legal_moves])
+        probs = np.exp(scores - scores.max())
+        probs /= probs.sum()
+        
+        ranked = sorted(zip(legal_moves, probs), key=lambda x: -x[1])[:n]
+        
+        return [
+            {"move": m[0].uci(), "prob": round(float(p), 4)} 
+            for m, p in ranked
+        ]

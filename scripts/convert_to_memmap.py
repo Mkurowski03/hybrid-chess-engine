@@ -1,22 +1,6 @@
-#!/usr/bin/env python3
-"""Convert HDF5 dataset → numpy memmap files for fast training I/O.
-
-Usage
------
-    python scripts/convert_to_memmap.py data/train.h5 data/
-
-Creates:
-    data/states.npy   (N, 18, 8, 8) float32
-    data/policies.npy (N,)          int64
-    data/values.npy   (N,)          float32
-    data/meta.json    { "n_positions": N }
-"""
-
-from __future__ import annotations
-
 import argparse
 import json
-import sys
+import logging
 import time
 from pathlib import Path
 
@@ -24,70 +8,102 @@ import h5py
 import numpy as np
 from tqdm import tqdm
 
-
-def convert(h5_path: Path, out_dir: Path, chunk: int = 100_000) -> None:
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    with h5py.File(h5_path, "r") as f:
-        n = f["states"].shape[0]
-        print(f"  Positions: {n:,}")
-        print(f"  Output:    {out_dir}")
-
-        # Create memmap files
-        states_mm = np.lib.format.open_memmap(
-            str(out_dir / "states.npy"), mode="w+",
-            dtype=np.float32, shape=(n, 18, 8, 8),
-        )
-        policies_mm = np.lib.format.open_memmap(
-            str(out_dir / "policies.npy"), mode="w+",
-            dtype=np.int64, shape=(n,),
-        )
-        values_mm = np.lib.format.open_memmap(
-            str(out_dir / "values.npy"), mode="w+",
-            dtype=np.float32, shape=(n,),
-        )
-
-        # Copy in chunks with progress bar
-        for start in tqdm(range(0, n, chunk), desc="Converting", unit="chunk"):
-            end = min(start + chunk, n)
-            states_mm[start:end] = f["states"][start:end]
-            policies_mm[start:end] = f["policies"][start:end]
-            values_mm[start:end] = f["values"][start:end]
-
-        # Flush
-        del states_mm, policies_mm, values_mm
-
-    # Save metadata
-    meta = {"n_positions": n}
-    with open(out_dir / "meta.json", "w") as mf:
-        json.dump(meta, mf, indent=2)
-
-    # Report sizes
-    s_mb = (out_dir / "states.npy").stat().st_size / 1e6
-    p_mb = (out_dir / "policies.npy").stat().st_size / 1e6
-    v_mb = (out_dir / "values.npy").stat().st_size / 1e6
-    print(f"\n✅ Done!")
-    print(f"   states.npy   : {s_mb:,.1f} MB")
-    print(f"   policies.npy : {p_mb:,.1f} MB")
-    print(f"   values.npy   : {v_mb:,.1f} MB")
-    print(f"   Total        : {s_mb + p_mb + v_mb:,.1f} MB")
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    datefmt='%H:%M:%S'
+)
+logger = logging.getLogger(__name__)
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="HDF5 → numpy memmap conversion")
-    parser.add_argument("h5_path", type=Path, help="Path to train.h5")
-    parser.add_argument("out_dir", type=Path, help="Output directory for .npy files")
+def create_memmap(path, shape, dtype):
+    """Helper to create a writeable memmap file ensures consistent mode."""
+    return np.lib.format.open_memmap(
+        str(path), mode="w+", dtype=dtype, shape=shape
+    )
+
+
+def convert_dataset(h5_path: Path, output_dir: Path, chunk_size=100_000):
+    """
+    Streams data from HDF5 to Numpy Memmap to allow fast random access during training.
+    """
+    if not h5_path.exists():
+        logger.error(f"Input file not found: {h5_path}")
+        return
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    logger.info(f"Source: {h5_path}")
+    logger.info(f"Destination: {output_dir}")
+
+    try:
+        with h5py.File(h5_path, "r") as f:
+            # Check for expected datasets
+            if "states" not in f or "policies" not in f or "values" not in f:
+                logger.error("HDF5 file is missing required datasets (states, policies, values).")
+                return
+
+            total_samples = f["states"].shape[0]
+            logger.info(f"Found {total_samples:,} samples to process.")
+
+            # Prepare output paths
+            path_states = output_dir / "states.npy"
+            path_policies = output_dir / "policies.npy"
+            path_values = output_dir / "values.npy"
+
+            # Initialize memmaps (N, 18, 8, 8 is the standard board tensor shape)
+            logger.info("Allocating memmap files...")
+            states_mm = create_memmap(path_states, (total_samples, 18, 8, 8), np.float32)
+            policies_mm = create_memmap(path_policies, (total_samples,), np.int64)
+            values_mm = create_memmap(path_values, (total_samples,), np.float32)
+
+            # Process in chunks to maintain low RAM usage
+            logger.info(f"Starting conversion (chunk size: {chunk_size})...")
+            
+            for start_idx in tqdm(range(0, total_samples, chunk_size), unit="chunk"):
+                end_idx = min(start_idx + chunk_size, total_samples)
+                
+                # Direct slice copy - efficient for HDF5 -> Memmap
+                states_mm[start_idx:end_idx] = f["states"][start_idx:end_idx]
+                policies_mm[start_idx:end_idx] = f["policies"][start_idx:end_idx]
+                values_mm[start_idx:end_idx] = f["values"][start_idx:end_idx]
+
+            # Explicit cleanup is often necessary on Windows to release file handles
+            del states_mm
+            del policies_mm
+            del values_mm
+
+        # Save metadata for the dataloader
+        meta_path = output_dir / "meta.json"
+        with open(meta_path, "w") as mf:
+            json.dump({"n_positions": total_samples}, mf, indent=2)
+
+        # Log file sizes
+        s_size = path_states.stat().st_size / (1024**2)
+        p_size = path_policies.stat().st_size / (1024**2)
+        v_size = path_values.stat().st_size / (1024**2)
+        
+        logger.info("Conversion complete.")
+        logger.info(f"Final sizes: states={s_size:.1f}MB, policies={p_size:.1f}MB, values={v_size:.1f}MB")
+
+    except Exception as e:
+        logger.exception("Critical error during conversion")
+        raise
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Convert HDF5 dataset to Numpy Memmap.")
+    parser.add_argument("h5_path", type=Path, help="Path to input .h5 file")
+    parser.add_argument("output_dir", type=Path, help="Output directory")
+    parser.add_argument("--chunk", type=int, default=100_000, help="Processing chunk size")
+    
     args = parser.parse_args()
 
-    print()
-    print("=" * 50)
-    print("  HDF5 → Memmap Conversion")
-    print("=" * 50)
-
-    t0 = time.perf_counter()
-    convert(args.h5_path, args.out_dir)
-    elapsed = time.perf_counter() - t0
-    print(f"   Time        : {elapsed:.1f}s\n")
+    start_time = time.perf_counter()
+    convert_dataset(args.h5_path, args.output_dir, args.chunk)
+    elapsed = time.perf_counter() - start_time
+    
+    logger.info(f"Total time: {elapsed:.2f}s")
 
 
 if __name__ == "__main__":
