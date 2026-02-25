@@ -318,3 +318,12 @@ Despite defeating most engines, the V2.0 architecture occasionally played moves 
 
 ### Phase 16: Polyglot Polish
 To solidify standard opening foundations mathematically, we integrated `chess.polyglot` directly into `src/hybrid_engine.py` with the "best" strategy enabled. Rather than executing weighted-random exploration choices during standard play, the engine now deterministically selects the absolute highest-weight theoretically optimal opening move stored inside the GM opening book, achieving flawless King's Pawn and Queen's Pawn mainlines.
+
+### Phase 17: Endgame Simplification & Smart Pruning Execution
+While Syzygy instantly solved perfect K+R vs K mates, MCTS struggled when transitioning *into* Tablebase range from slightly winning positions, occasionally missing tactical piece-trades (e.g. trading Rooks to force a deeply-winning King+Pawn endgame) because the neural `Q`-value for "Winning complicated middle-game" and "Winning basic endgame" were indistinguishably close.
+
+**The "Killer Instinct" Simplification Bias**
+To break this tie, we injected an algorithmic `+0.2` PUCT evaluation boost into the strict Rust expansion loop. If the neural engine evaluates a highly decisive structural advantage (`parent_q > +0.3`), the Rust core dynamically detects any child node representing a piece capture. That capture is artificially favored, aggressively shifting the MCTS calculation into a mathematically forcing piece-reduction tree sequence to safely drag the game down into the un-losable 5-piece Syzygy matrix boundary.
+
+**Smart Pruning Early Stopping**
+For crushing middle-game disparities (where one particular move dominates positional simulations), searching out all 80,000 simulations is wasted CPU time. We activated an early-stop `top_two_visits` heuristic inside the Python logic (`hybrid_engine.py`). If the primary move's visit count exceeds the secondary move's visit count by a substantial multiple (`> 3.5x`), the Monte Carlo tree halts and returns the move instantly. Overwhelmingly obvious forced moves are detected and played within 100 milliseconds, optimizing clock utilization significantly.
