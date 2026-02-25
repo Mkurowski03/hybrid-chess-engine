@@ -243,7 +243,8 @@ class HybridEngine:
         if self.tablebase is not None and self.model_cfg and self.model_cfg.syzygy_path:
             tb_path_str = self.model_cfg.syzygy_path
             
-        rust_mcts = chess_engine_core.RustMCTS(fen, cpuct, discount, tb_path_str)
+        from config import SIMPLIFICATION_FACTOR
+        rust_mcts = chess_engine_core.RustMCTS(fen, cpuct, discount, tb_path_str, SIMPLIFICATION_FACTOR)
 
         current_sims = 0
         

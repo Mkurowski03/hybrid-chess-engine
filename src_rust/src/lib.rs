@@ -177,13 +177,14 @@ pub struct RustMCTS {
     cpuct: f32,
     discount: f32,
     tablebase: Option<Tablebase<Chess>>,
+    simplification_factor: f32,
 }
 
 #[pymethods]
 impl RustMCTS {
     #[new]
-    #[pyo3(signature = (fen, cpuct=None, discount=None, syzygy_path=None))]
-    pub fn new(fen: &str, cpuct: Option<f32>, discount: Option<f32>, syzygy_path: Option<&str>) -> PyResult<Self> {
+    #[pyo3(signature = (fen, cpuct=None, discount=None, syzygy_path=None, simplification_factor=None))]
+    pub fn new(fen: &str, cpuct: Option<f32>, discount: Option<f32>, syzygy_path: Option<&str>, simplification_factor: Option<f32>) -> PyResult<Self> {
         let setup = Fen::from_str(fen)
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("Invalid FEN: {}", e)))?;
         let pos = setup.into_position(CastlingMode::Standard)
@@ -205,6 +206,7 @@ impl RustMCTS {
             cpuct: cpuct.unwrap_or(1.25),
             discount: discount.unwrap_or(0.99),
             tablebase,
+            simplification_factor: simplification_factor.unwrap_or(0.0),
         })
     }
 
@@ -227,7 +229,23 @@ impl RustMCTS {
                     let q = if child.visits > 0 { -(child.value_sum / child.visits as f32) } else { 0.0 };
                     let u = self.cpuct * child.prior * (parent_visits as f32).sqrt() / (1.0 + child.visits as f32);
                     
-                    let score = q + u;
+                    let mut score = q + u;
+                    
+                    // Simplification Bias
+                    let parent_piece_count = self.nodes[curr].pos.board().occupied().count();
+                    if parent_piece_count <= 7 {
+                        let parent_q = if parent_visits > 0 { self.nodes[curr].value_sum / parent_visits as f32 } else { 0.0 };
+                        if parent_q > 0.8 {
+                            let child_piece_count = child.pos.board().occupied().count();
+                            let is_capture = child_piece_count < parent_piece_count;
+                            let is_promotion = child.action.as_ref().map_or(false, |a| a.len() == 5);
+                            
+                            if is_capture || is_promotion {
+                                score += self.simplification_factor;
+                            }
+                        }
+                    }
+                    
                     if score > best_score {
                         best_score = score;
                         best_child = Some(child_id);
@@ -263,7 +281,7 @@ impl RustMCTS {
                         0.0
                     };
                     
-                    let penalty = if parent_q > 0.1 { -5.0 } else { 0.0 };
+                    let penalty = if parent_q > 0.5 { -5.0 } else { 0.0 };
                     
                     // Backpropagate the repetition (0.0 or -5.0 penalty)
                     let mut back_curr = curr;
