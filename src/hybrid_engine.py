@@ -89,7 +89,7 @@ class HybridEngine:
         cpuct: float = 1.25,
         material_weight: float = 0.15,
         discount: float = 0.90,
-        batch_size: int = 16,
+        batch_size: int = 512,
         wtime: Optional[int] = None,
         btime: Optional[int] = None,
         winc: int = 0,
@@ -258,22 +258,7 @@ class HybridEngine:
             batch_len = len(node_ids)
             current_sims += batch_len
 
-            # Emergency Brake Time Check
-            if search_context and search_context.get("stop_flag"):
-                logging.info("Forced stop received.")
-                break
 
-            is_pondering = search_context and search_context.get("pondering", False)
-            
-            if not is_pondering and alloc_time_ms is not None:
-                # If we were pondering but got a ponderhit, our start time was effectively reset dynamically
-                # or we just rely on normal time elapsed. 
-                # Re-check start_time from search_context if it was updated during ponderhit
-                effective_start = search_context.get("ponderhit_time", start_time) if search_context else start_time
-                elapsed_ms = (time.time() - effective_start) * 1000.0
-                if elapsed_ms > alloc_time_ms or elapsed_ms > safe_time_ms:
-                    # Timeout! Abort search immediately
-                    break
 
             # 2. PyTorch evaluates on GPU
             # Convert list of 3D numpy arrays to a single 4D Torch tensor (B, 18, 8, 8)
@@ -315,29 +300,40 @@ class HybridEngine:
             # 3. Rust updates the tree
             rust_mcts.backpropagate(node_ids, val_list, pol_list)
             
-            # --- SMART PRUNING / EARLY STOPPING ---
-            # Wait for at least MIN_PRUNING_SIMS before deciding to prune
-            from config import MIN_PRUNING_SIMS, SMART_PRUNING_FACTOR
-            if current_sims >= MIN_PRUNING_SIMS and current_sims % 1000 < batch_size:
-                v1, v2 = rust_mcts.top_two_visits()
-                if v1 > SMART_PRUNING_FACTOR * max(v2, 1):
-                    logging.info(f"[SMART PRUNING] Dominant move found (Visits: {v1} vs {v2}). Stopping early at {current_sims} sims.")
+            # --- PERIODIC CHECKS (TIME, PRUNING, LOGGING) ---
+            # To eliminate CPU overhead, only query the system clock every ~4096 nodes
+            if current_sims % 4096 < batch_len:
+                # 1. Emergency Time Check
+                if search_context and search_context.get("stop_flag"):
+                    logging.info("Forced stop received.")
                     break
-            # ----------------------------------------
-            
-            # --- LIVE LOGGING (Silent Mode / Log Throttling) ---
-            curr_time = time.time()
-            if curr_time - last_log_time >= 1.0:
-                # Output UCI Info at most once per second to prevent I/O blocking and NPS drops
-                temp_best = rust_mcts.best_move()
-                elapsed_ms = int((curr_time - start_time) * 1000)
-                nps = int(current_sims / ((curr_time - start_time) + 1e-6))
-                
-                info_str = f"info depth {current_sims} score cp 0 time {elapsed_ms} nodes {current_sims} nps {nps} pv {temp_best}"
-                print(info_str)
-                sys.stdout.flush()
-                
-                last_log_time = curr_time
+
+                is_pondering = search_context and search_context.get("pondering", False)
+                if not is_pondering and alloc_time_ms is not None:
+                    effective_start = search_context.get("ponderhit_time", start_time) if search_context else start_time
+                    elapsed_ms_check = (time.time() - effective_start) * 1000.0
+                    if elapsed_ms_check > alloc_time_ms or elapsed_ms_check > safe_time_ms:
+                        break
+                        
+                # 2. Smart Pruning / Early Stopping
+                from config import MIN_PRUNING_SIMS, SMART_PRUNING_FACTOR
+                if current_sims >= MIN_PRUNING_SIMS:
+                    v1, v2 = rust_mcts.top_two_visits()
+                    if v1 > SMART_PRUNING_FACTOR * max(v2, 1):
+                        logging.info(f"[SMART PRUNING] Dominant move found (Visits: {v1} vs {v2}). Stopping early at {current_sims} sims.")
+                        break
+
+                # 3. Live Logging (Silent Mode)
+                curr_time = time.time()
+                if curr_time - last_log_time >= 1.0:
+                    temp_best = rust_mcts.best_move()
+                    elapsed_ms_log = int((curr_time - start_time) * 1000)
+                    nps = int(current_sims / ((curr_time - start_time) + 1e-6))
+                    info_str = f"info depth {current_sims} score cp 0 time {elapsed_ms_log} nodes {current_sims} nps {nps} pv {temp_best}"
+                    print(info_str)
+                    sys.stdout.flush()
+                    last_log_time = curr_time
+            # ------------------------------------------------
             
         best_uci = rust_mcts.best_move()
         self.last_pv = rust_mcts.principal_variation()

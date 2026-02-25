@@ -27,7 +27,7 @@ def main() -> None:
     parser.add_argument("--cpuct", type=float, default=1.25, help="PUCT exploration constant")
     parser.add_argument("--discount", type=float, default=0.90, help="Checkmate discount factor")
     parser.add_argument("--material", type=float, default=0.15, help="Material weight")
-    parser.add_argument("--batch_size", type=int, default=128, help="Batch size for GPU MCTS")
+    parser.add_argument("--batch_size", type=int, default=512, help="Batch size for GPU MCTS")
     parser.add_argument("--book", type=str, default="books/opening_book.bin", help="Path to Polyglot opening book")
     args = parser.parse_args()
 

@@ -16,6 +16,9 @@ from typing import List
 SMART_PRUNING_FACTOR = 3.5
 MIN_PRUNING_SIMS = 20000
 
+# ── Search Performance ─────────────────────────────────────────────────
+SEARCH_BATCH_SIZE = 512
+
 
 # ── Model ──────────────────────────────────────────────────────────────
 @dataclass
