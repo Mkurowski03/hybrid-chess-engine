@@ -119,11 +119,15 @@ def api_move() -> tuple[Response, int] | Response:
 
     # Evaluation from white's perspective for the eval bar
     eval_white = evaluation if board.turn == chess.WHITE else -evaluation
+    
+    # Safely retrieve PV
+    pv = getattr(engine, 'last_pv', [])
 
     return jsonify({
         "move": move.uci(),
         "san": board.san(move),
         "evaluation": round(eval_white, 3),
+        "pv": pv,
         "game_over": False,
     })
 

@@ -576,6 +576,13 @@
                 <div class="move-list" id="topMoves">
                     <div style="color: var(--text-muted); font-size: 0.85rem;">Make a move to see analysis</div>
                 </div>
+                <div style="margin-top: 1rem;">
+                    <span class="panel-title" style="display: block; margin-bottom: 0.3rem;">Expected Line (PV)</span>
+                    <div id="expectedLine"
+                        style="font-family: 'JetBrains Mono', monospace; font-size: 0.8rem; color: var(--accent); line-height: 1.4;">
+                        —
+                    </div>
+                </div>
             </div>
 
             <!-- Move History -->
@@ -898,6 +905,31 @@
                     board.position(game.fen());
                     updateHistory();
                     updateEval(data.evaluation);
+                }
+
+                if (data.pv && data.pv.length > 0) {
+                    // Try to generate easy SAN from UCI strings for the UI if possible
+                    let pv_sans = [];
+                    let temp_game = new Chess(game.fen());
+                    for (let m of data.pv) {
+                        try {
+                            let parsed = temp_game.move({
+                                from: m.substring(0, 2),
+                                to: m.substring(2, 4),
+                                promotion: m.length > 4 ? m[4] : undefined
+                            });
+                            if (parsed) {
+                                pv_sans.push(parsed.san);
+                            } else {
+                                pv_sans.push(m); // Fallback to raw UCI
+                            }
+                        } catch (e) {
+                            pv_sans.push(m);
+                        }
+                    }
+                    document.getElementById('expectedLine').textContent = pv_sans.join(' ');
+                } else {
+                    document.getElementById('expectedLine').textContent = '—';
                 }
 
                 fetchTopMoves();

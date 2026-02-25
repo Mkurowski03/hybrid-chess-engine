@@ -94,7 +94,8 @@ class HybridEngine:
         btime: Optional[int] = None,
         winc: int = 0,
         binc: int = 0,
-        book_strategy: str = "best"
+        book_strategy: str = "best",
+        search_context: Optional[Dict[str, Any]] = None,
     ) -> chess.Move:
         """Select a move using Rust MCTS + PyTorch Network.
 
@@ -109,6 +110,7 @@ class HybridEngine:
             btime (Optional[int]): Black time remaining in milliseconds.
             winc (int): White increment per move in milliseconds.
             binc (int): Black increment per move in milliseconds.
+            search_context: Dictionary tracking dynamic state like "stop_flag", "pondering".
 
         Returns:
             chess.Move: The selected best move.
@@ -135,11 +137,13 @@ class HybridEngine:
                                 best_entry = entry
                         if best_entry:
                             logging.info(f"[BOOK] Found best move {best_entry.move.uci()} (weight: {best_entry.weight})")
+                            self.last_pv = [best_entry.move.uci()]
                             return best_entry.move
                     else:
                         entry = reader.weighted_choice(board)
                         if entry:
                             logging.info(f"[BOOK] Found move {entry.move.uci()} (weight: {entry.weight})")
+                            self.last_pv = [entry.move.uci()]
                             return entry.move
             except IndexError:
                 pass
@@ -189,6 +193,7 @@ class HybridEngine:
                                 
                         if best_move:
                             logging.info(f"[SYZYGY] Perfect endgame move found: {best_move.uci()} (WDL: {wdl})")
+                            self.last_pv = [best_move.uci()]
                             return best_move
                 except chess.syzygy.MissingTableError:
                     pass
@@ -254,8 +259,18 @@ class HybridEngine:
             current_sims += batch_len
 
             # Emergency Brake Time Check
-            if alloc_time_ms is not None:
-                elapsed_ms = (time.time() - start_time) * 1000.0
+            if search_context and search_context.get("stop_flag"):
+                logging.info("Forced stop received.")
+                break
+
+            is_pondering = search_context and search_context.get("pondering", False)
+            
+            if not is_pondering and alloc_time_ms is not None:
+                # If we were pondering but got a ponderhit, our start time was effectively reset dynamically
+                # or we just rely on normal time elapsed. 
+                # Re-check start_time from search_context if it was updated during ponderhit
+                effective_start = search_context.get("ponderhit_time", start_time) if search_context else start_time
+                elapsed_ms = (time.time() - effective_start) * 1000.0
                 if elapsed_ms > alloc_time_ms or elapsed_ms > safe_time_ms:
                     # Timeout! Abort search immediately
                     break
@@ -300,6 +315,16 @@ class HybridEngine:
             # 3. Rust updates the tree
             rust_mcts.backpropagate(node_ids, val_list, pol_list)
             
+            # --- SMART PRUNING / EARLY STOPPING ---
+            # Wait for at least MIN_PRUNING_SIMS before deciding to prune
+            from config import MIN_PRUNING_SIMS, SMART_PRUNING_FACTOR
+            if current_sims >= MIN_PRUNING_SIMS and current_sims % 1000 < batch_size:
+                v1, v2 = rust_mcts.top_two_visits()
+                if v1 > SMART_PRUNING_FACTOR * max(v2, 1):
+                    logging.info(f"[SMART PRUNING] Dominant move found (Visits: {v1} vs {v2}). Stopping early at {current_sims} sims.")
+                    break
+            # ----------------------------------------
+            
             # --- LIVE LOGGING ---
             curr_time = time.time()
             if current_sims % 2000 < batch_size or curr_time - last_log_time >= 0.5:
@@ -317,12 +342,13 @@ class HybridEngine:
                 last_log_time = curr_time
             
         best_uci = rust_mcts.best_move()
+        self.last_pv = rust_mcts.principal_variation()
         
         # Log final stats
         final_time = time.time()
         final_elapsed = final_time - start_time
         final_nps = int(current_sims / (final_elapsed + 1e-6))
-        logging.info(f"[DONE] Move: {best_uci} | Sims: {current_sims} | Time Used: {final_elapsed:.2f}s | NPS: {final_nps}")
+        logging.info(f"[DONE] Move: {best_uci} | PV: {' '.join(self.last_pv)} | Sims: {current_sims} | Time Used: {final_elapsed:.2f}s | NPS: {final_nps}")
         
         try:
             return chess.Move.from_uci(best_uci)

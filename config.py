@@ -12,6 +12,11 @@ from pathlib import Path
 from typing import List
 
 
+# ── Early Stopping / Pondering ─────────────────────────────────────────
+SMART_PRUNING_FACTOR = 3.5
+MIN_PRUNING_SIMS = 20000
+
+
 # ── Model ──────────────────────────────────────────────────────────────
 @dataclass
 class ModelConfig:

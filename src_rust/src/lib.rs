@@ -445,6 +445,57 @@ impl RustMCTS {
         }
         best_m
     }
+
+    pub fn top_two_visits(&self) -> (u32, u32) {
+        let mut best_n = 0;
+        let mut second_best_n = 0;
+        
+        for &child_id in &self.nodes[self.root].children {
+            let n = self.nodes[child_id].visits;
+            if n > best_n {
+                second_best_n = best_n;
+                best_n = n;
+            } else if n > second_best_n {
+                second_best_n = n;
+            }
+        }
+        (best_n, second_best_n)
+    }
+
+    pub fn principal_variation(&self) -> Vec<String> {
+        let mut pv = Vec::new();
+        let mut curr = self.root;
+        
+        for _ in 0..10 { // Limit PV depth to 10 moves
+            let mut best_n = 0;
+            let mut best_m = String::new();
+            let mut best_child = None;
+            
+            for &child_id in &self.nodes[curr].children {
+                let n = self.nodes[child_id].visits;
+                if n > best_n {
+                    best_n = n;
+                    if let Some(action) = &self.nodes[child_id].action {
+                        best_m = action.clone();
+                    }
+                    best_child = Some(child_id);
+                }
+            }
+            
+            if best_n > 0 {
+                pv.push(best_m);
+                if let Some(c) = best_child {
+                    curr = c;
+                } else {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+        
+        pv
+    }
 }
 
 #[pymodule]

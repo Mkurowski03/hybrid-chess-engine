@@ -43,7 +43,10 @@ def main() -> None:
         sys.stderr.write(f"Error loading engine: {msg}\n")
         sys.exit(1)
 
+    import threading
     board = chess.Board()
+    search_thread = None
+    search_context = {"stop_flag": False, "pondering": False, "ponderhit_time": 0.0}
 
     while True:
         try:
@@ -90,7 +93,10 @@ def main() -> None:
             elif command == "go":
                 # Start MCTS search using HybridEngine
                 wtime, btime, winc, binc = None, None, 0, 0
+                is_pondering = False
+                
                 for i in range(1, len(tokens)):
+                    if tokens[i] == 'ponder': is_pondering = True
                     try:
                         if tokens[i] == 'wtime': wtime = int(tokens[i+1])
                         elif tokens[i] == 'btime': btime = int(tokens[i+1])
@@ -99,21 +105,51 @@ def main() -> None:
                     except (IndexError, ValueError):
                         pass
 
-                logging.info(f"[START] Time allocated: wtime={wtime}, btime={btime}, winc={winc}, binc={binc}")
+                logging.info(f"[START] Time allocated: wtime={wtime}, btime={btime}, winc={winc}, binc={binc} | ponder={is_pondering}")
 
-                best_move = engine.select_move(
-                    board, 
-                    sims=args.sims, 
-                    cpuct=args.cpuct,
-                    material_weight=args.material,
-                    discount=args.discount,
-                    batch_size=args.batch_size,
-                    wtime=wtime,
-                    btime=btime,
-                    winc=winc,
-                    binc=binc
-                )
-                print(f"bestmove {best_move.uci()}", flush=True)
+                search_context["pondering"] = is_pondering
+                search_context["stop_flag"] = False
+                
+                # Stop any existing search just in case
+                if search_thread is not None and search_thread.is_alive():
+                    search_context["stop_flag"] = True
+                    search_thread.join()
+                    search_context["stop_flag"] = False
+
+                def _search_task():
+                    import time
+                    best_move = engine.select_move(
+                        board.copy(), 
+                        sims=args.sims, 
+                        cpuct=args.cpuct,
+                        material_weight=args.material,
+                        discount=args.discount,
+                        batch_size=args.batch_size,
+                        wtime=wtime,
+                        btime=btime,
+                        winc=winc,
+                        binc=binc,
+                        search_context=search_context
+                    )
+                    
+                    # If we were forcibly stopped without pondering resolution, we still output bestmove 
+                    # as engine relies on bestmove response to end go task
+                    print(f"bestmove {best_move.uci()}", flush=True)
+
+                search_thread = threading.Thread(target=_search_task, daemon=True)
+                search_thread.start()
+                
+            elif command == "ponderhit":
+                if search_context["pondering"]:
+                    import time
+                    search_context["pondering"] = False
+                    search_context["ponderhit_time"] = time.time()
+                    logging.info("[PONDERHIT] Transitioning to active search time management.")
+                    
+            elif command == "stop":
+                search_context["stop_flag"] = True
+                if search_thread is not None:
+                    search_thread.join(timeout=2.0)
                 
             elif command == "quit":
                 break
