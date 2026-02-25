@@ -1,0 +1,8 @@
+torch>=2.0
+numpy
+python-chess
+Flask
+flask-cors
+maturin
+onnx
+onnxruntime-gpu
