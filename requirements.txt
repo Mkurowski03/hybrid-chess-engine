@@ -6,3 +6,4 @@ flask-cors
 maturin
 onnx
 onnxruntime-gpu
+tqdm
