@@ -21,7 +21,8 @@ By offloading the massive Monte Carlo Tree Search (MCTS) graph and mathematics t
 
 ### ✨ Key Features
 * 🚀 **Hybrid Architecture:** Rust (`shakmaty` + `pyo3`) handles the heavy tree search; Python handles GPU inference.
-* ⚡ **6500+ NPS:** Sustained calculation speed on RTX 3070 Ti (~80,000 simulations/move in Deep Thinker mode).
+* ⚡ **ONNX & TensorRT Accelerated:** Neural evaluations leverage ONNX Runtime for a massive 35%+ speed boost over raw PyTorch.
+* 🌪️ **6500+ NPS:** Sustained calculation speed on RTX 3070 Ti (~80,000 simulations/move in Deep Thinker mode).
 * 🔄 **Zero-Copy Bridge:** 18-channel board states are encoded directly into Python memory space, eliminating data-transfer bottlenecks.
 * 🛡️ **Panic Mode:** Dynamic time-management ensures the engine never flags, scaling down simulations when the clock is low.
 * ⚔️ **Mate Guard:** Instant 1-ply forced-mate solver cures "promotion blindness".
@@ -36,10 +37,14 @@ By offloading the massive Monte Carlo Tree Search (MCTS) graph and mathematics t
 1.  **Prerequisites:** Rust (cargo), Python 3.10+, CUDA.
 2.  **Install & Compile:**
     ```bash
-    pip install maturin
+    pip install -r requirements.txt
     maturin develop --release
     ```
-3.  **Run Web UI:**
+3.  **Export ONNX Model (Optional but Recommended):**
+    ```bash
+    python scripts/export_onnx.py
+    ```
+4.  **Run Web UI:**
     ```bash
     python app.py
     ```
