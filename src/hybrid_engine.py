@@ -325,10 +325,10 @@ class HybridEngine:
                     break
             # ----------------------------------------
             
-            # --- LIVE LOGGING ---
+            # --- LIVE LOGGING (Silent Mode / Log Throttling) ---
             curr_time = time.time()
-            if current_sims % 2000 < batch_size or curr_time - last_log_time >= 0.5:
-                # Output UCI Info
+            if curr_time - last_log_time >= 1.0:
+                # Output UCI Info at most once per second to prevent I/O blocking and NPS drops
                 temp_best = rust_mcts.best_move()
                 elapsed_ms = int((curr_time - start_time) * 1000)
                 nps = int(current_sims / ((curr_time - start_time) + 1e-6))
@@ -336,8 +336,6 @@ class HybridEngine:
                 info_str = f"info depth {current_sims} score cp 0 time {elapsed_ms} nodes {current_sims} nps {nps} pv {temp_best}"
                 print(info_str)
                 sys.stdout.flush()
-                sys.stderr.write(info_str + "\n")
-                sys.stderr.flush()
                 
                 last_log_time = curr_time
             
