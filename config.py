@@ -55,7 +55,7 @@ class DataConfig:
 class TrainConfig:
     """Training loop configuration."""
     batch_size: int = 1024         # Fits 8GB VRAM with FP16
-    num_epochs: int = 30
+    num_epochs: int = 50
     learning_rate: float = 2e-3
     weight_decay: float = 1e-4
     val_split: float = 0.1

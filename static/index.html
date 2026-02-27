@@ -427,19 +427,21 @@
             color: var(--text-primary);
         }
 
-        /* Game over overlay */
         .game-over-overlay {
             display: none;
             position: absolute;
-            inset: 0;
-            background: rgba(15, 15, 19, 0.85);
+            bottom: 0;
+            left: 0;
+            right: 0;
+            background: rgba(15, 15, 19, 0.92);
             backdrop-filter: blur(8px);
-            border-radius: 16px;
+            border-radius: 0 0 16px 16px;
             z-index: 10;
-            flex-direction: column;
+            flex-direction: row;
             align-items: center;
             justify-content: center;
             gap: 1rem;
+            padding: 0.75rem 1.25rem;
         }
 
         .game-over-overlay.visible {
@@ -447,7 +449,7 @@
         }
 
         .game-over-text {
-            font-size: 1.8rem;
+            font-size: 1rem;
             font-weight: 700;
             background: linear-gradient(135deg, var(--accent), #c084fc);
             -webkit-background-clip: text;
@@ -456,7 +458,7 @@
         }
 
         .game-over-result {
-            font-size: 1rem;
+            font-size: 0.85rem;
             color: var(--text-secondary);
         }
 
@@ -542,7 +544,8 @@
                 <div class="game-over-overlay" id="gameOverOverlay">
                     <div class="game-over-text" id="gameOverText">Game Over</div>
                     <div class="game-over-result" id="gameOverResult"></div>
-                    <button class="btn primary" onclick="newGame()">New Game</button>
+                    <button class="btn primary" onclick="newGame()"
+                        style="flex:0; min-width:auto; padding:0.4rem 1rem; font-size:0.75rem;">New Game</button>
                 </div>
                 <div class="promo-overlay" id="promoOverlay">
                     <div class="promo-title">Promote pawn to:</div>
@@ -617,30 +620,43 @@
                     <button class="side-btn active" id="sideWhite" onclick="chooseSide('white')">♔ White</button>
                     <button class="side-btn" id="sideBlack" onclick="chooseSide('black')">♚ Black</button>
                     <button class="side-btn" id="sideWatch" onclick="chooseSide('watch')">👁 Watch</button>
+                    <button class="side-btn" id="sideArena" onclick="chooseSide('arena')">⚔ Arena</button>
+                </div>
+            </div>
+
+            <!-- Arena Config -->
+            <div class="panel" id="arenaPanel" style="display: none;">
+                <div class="panel-title">Arena — Model vs Model</div>
+                <div style="margin-bottom: 0.5rem;">
+                    <label
+                        style="font-size: 0.75rem; color: var(--text-secondary); display: block; margin-bottom: 0.25rem;">♔
+                        White Model</label>
+                    <select id="arenaWhiteModel">
+                        <option value="">Loading...</option>
+                    </select>
+                </div>
+                <div style="margin-bottom: 0.75rem;">
+                    <label
+                        style="font-size: 0.75rem; color: var(--text-secondary); display: block; margin-bottom: 0.25rem;">♚
+                        Black Model</label>
+                    <select id="arenaBlackModel">
+                        <option value="">Loading...</option>
+                    </select>
+                </div>
+                <button class="btn primary" onclick="startArena()" style="width: 100%;">⚔ Start Arena</button>
+                <div id="arenaStatus"
+                    style="margin-top: 0.5rem; font-size: 0.75rem; color: var(--text-muted); font-family: 'JetBrains Mono', monospace; text-align: center;">
                 </div>
             </div>
 
             <!-- Engine Personality -->
             <div class="panel">
                 <div class="panel-title">Engine Personality</div>
-                <select id="personalitySelect" onchange="updatePersonality()">
-                    <option value='{"sims":40000,"cpuct":1.25,"material":0.15,"discount":0.90}' selected>Hybrid Beast
-                        (Rust 40k | Grandmaster level deep search)</option>
-                    <option value='{"sims":2200,"cpuct":1.25,"material":0.15,"discount":0.90}'>Champion_Rapid (2200 Sims
-                        | Positional)</option>
-                    <option value='{"sims":2200,"cpuct":0.80,"material":0.15,"discount":0.90}'>Sniper_Rapid (2200 Sims |
-                        Tactical)</option>
-                    <option value='{"sims":2200,"cpuct":1.25,"material":0.35,"discount":0.90}'>Solid_Rapid (2200 Sims |
-                        Materialistic)</option>
-                    <option value='{"sims":600,"cpuct":1.25,"material":0.15,"discount":0.99}'>MCTS_Baseline (600 Sims |
-                        Blitz)</option>
-                </select>
+                <div style="font-size: 0.85rem; font-weight: 500; color: var(--text-primary); margin-bottom: 0.4rem;">
+                    Hybrid Beast (Rust 40k)</div>
                 <div id="personalityDetails"
-                    style="margin-top:0.5rem; font-size:0.75rem; color:var(--text-muted); font-family:'JetBrains Mono', monospace;">
-                    Sims: 600<br>
-                    Cpuct: 1.25<br>
-                    Material: 0.15<br>
-                    Discount: 0.99
+                    style="font-size:0.75rem; color:var(--text-muted); font-family:'JetBrains Mono', monospace;">
+                    Sims: 40000 &bull; Cpuct: 1.25 &bull; Material: 0.15 &bull; Discount: 0.90
                 </div>
             </div>
 
@@ -648,7 +664,9 @@
             <div class="panel">
                 <div class="panel-title">Model Weights</div>
                 <select id="modelSelect" onchange="loadCheckpoint()">
-                    <option value="">Loading models...</option>
+                    <option value="checkpoints/baseline_v2/best_model.pt" selected>v2 — Best (Epoch 34, 50.2% acc)
+                    </option>
+                    <option value="checkpoints/baseline/best.pt">v1 — Best (Epoch 10)</option>
                 </select>
             </div>
         </div>
@@ -663,9 +681,10 @@
         let board = null;
         let game = new Chess();
         let moveHistory = [];
-        let playerColor = 'white'; // 'white', 'black', or 'watch'
+        let playerColor = 'white'; // 'white', 'black', 'watch', or 'arena'
         let pendingPromotion = null;
         let isEditMode = false;
+        let arenaRunning = false;
         const PIECE_URL = 'https://chessboardjs.com/img/chesspieces/wikipedia/{piece}.png';
 
         // Board config
@@ -681,43 +700,22 @@
         board = Chessboard('board', config);
         $(window).on('resize', () => board.resize());
 
-        // Load available checkpoints — prefer best.pt
-        fetch('/api/checkpoints')
-            .then(r => r.json())
-            .then(checkpoints => {
-                const select = document.getElementById('modelSelect');
-                select.innerHTML = '';
-                if (checkpoints.length === 0) {
-                    select.innerHTML = '<option value="">No models found</option>';
-                    return;
-                }
-                let bestIdx = checkpoints.length - 1;
-                checkpoints.forEach((cp, i) => {
-                    const opt = document.createElement('option');
-                    opt.value = cp.path;
-                    opt.textContent = cp.name;
-                    if (cp.name.includes('best')) bestIdx = i;
-                    select.appendChild(opt);
-                });
-                select.selectedIndex = bestIdx;
-                // Load best model on startup
-                loadCheckpoint();
-            })
-            .catch(() => {
-                document.getElementById('modelSelect').innerHTML =
-                    '<option value="">Could not load models</option>';
-            });
+        // Load the default model on startup
+        loadCheckpoint();
 
         // ── Side chooser ──
         function chooseSide(side) {
+            arenaRunning = false;
             document.querySelectorAll('.side-btn').forEach(b => b.classList.remove('active'));
             document.getElementById('side' + side.charAt(0).toUpperCase() + side.slice(1)).classList.add('active');
 
             playerColor = side;
 
+            // Show/hide arena panel
+            document.getElementById('arenaPanel').style.display = (side === 'arena') ? 'block' : 'none';
+
             if (side === 'black') {
                 board.orientation('black');
-                // If it's white's turn and we're playing black, engine moves first
                 if (game.turn() === 'w' && moveHistory.length === 0) {
                     updateStatus('thinking');
                     setTimeout(requestEngineMove, 100);
@@ -731,20 +729,20 @@
                 if (!game.game_over()) {
                     setTimeout(requestEngineMove, 300);
                 }
+            } else if (side === 'arena') {
+                board.orientation('white');
+                updateStatus('ready');
+                populateArenaDropdowns();
             }
         }
 
         // ── Get Active Personality ──
         function getPersonality() {
-            const select = document.getElementById('personalitySelect');
-            return JSON.parse(select.value);
+            return { sims: 40000, cpuct: 1.25, material: 0.15, discount: 0.90 };
         }
 
-        function updatePersonality() {
-            const p = getPersonality();
-            document.getElementById('personalityDetails').innerHTML =
-                `Sims: ${p.sims}<br>Cpuct: ${p.cpuct.toFixed(2)}<br>Material: ${p.material.toFixed(2)}<br>Discount: ${p.discount.toFixed(2)}`;
-        }
+        // No-op since personality is now fixed
+        function updatePersonality() { }
 
         // ── Suggest move ──
         async function suggestMove() {
@@ -882,10 +880,18 @@
 
         async function requestEngineMove() {
             try {
+                const p = getPersonality();
                 const res = await fetch('/api/move', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ fen: game.fen(), pgn: game.pgn() })
+                    body: JSON.stringify({
+                        fen: game.fen(),
+                        pgn: game.pgn(),
+                        sims: p.sims,
+                        cpuct: p.cpuct,
+                        material: p.material,
+                        discount: p.discount
+                    })
                 });
                 const data = await res.json();
 
@@ -1057,6 +1063,7 @@
         }
 
         function newGame() {
+            arenaRunning = false;
             game.reset();
             board.start();
             moveHistory = [];
@@ -1167,6 +1174,138 @@
                 } else {
                     updateStatus('ready');
                 }
+            }
+        }
+
+        // ── Arena Mode ──
+        function populateArenaDropdowns() {
+            fetch('/api/checkpoints')
+                .then(r => r.json())
+                .then(checkpoints => {
+                    ['arenaWhiteModel', 'arenaBlackModel'].forEach(id => {
+                        const sel = document.getElementById(id);
+                        sel.innerHTML = '';
+                        checkpoints.forEach(cp => {
+                            const opt = document.createElement('option');
+                            opt.value = cp.path;
+                            opt.textContent = cp.name;
+                            sel.appendChild(opt);
+                        });
+                    });
+                });
+        }
+
+        async function startArena() {
+            const whitePath = document.getElementById('arenaWhiteModel').value;
+            const blackPath = document.getElementById('arenaBlackModel').value;
+            if (!whitePath || !blackPath) return;
+
+            const statusEl = document.getElementById('arenaStatus');
+            statusEl.textContent = 'Loading models...';
+            updateStatus('thinking');
+
+            try {
+                const res = await fetch('/api/arena/load', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ white: whitePath, black: blackPath })
+                });
+                const data = await res.json();
+                if (data.error) {
+                    statusEl.textContent = 'Error: ' + data.error;
+                    updateStatus('error');
+                    return;
+                }
+            } catch (e) {
+                statusEl.textContent = 'Failed to load models';
+                updateStatus('error');
+                return;
+            }
+
+            // Reset the board and start
+            game.reset();
+            board.start();
+            moveHistory = [];
+            updateHistory();
+            updateEval(0);
+            document.getElementById('gameOverOverlay').classList.remove('visible');
+
+            const wName = document.getElementById('arenaWhiteModel').selectedOptions[0].textContent;
+            const bName = document.getElementById('arenaBlackModel').selectedOptions[0].textContent;
+            statusEl.textContent = `♔ ${wName}  vs  ♚ ${bName}`;
+
+            arenaRunning = true;
+            requestArenaMove();
+        }
+
+        async function requestArenaMove() {
+            if (!arenaRunning || game.game_over()) {
+                if (game.game_over()) showGameOver();
+                return;
+            }
+
+            const turn = game.turn() === 'w' ? 'White' : 'Black';
+            const statusEl = document.getElementById('arenaStatus');
+            const wName = document.getElementById('arenaWhiteModel').selectedOptions[0].textContent;
+            const bName = document.getElementById('arenaBlackModel').selectedOptions[0].textContent;
+
+            updateStatus('thinking');
+            const el = document.getElementById('status');
+            el.innerHTML = `<span class="dot"></span><span>${turn} is thinking… (${turn === 'White' ? wName : bName})</span>`;
+
+            const p = getPersonality();
+
+            try {
+                const res = await fetch('/api/arena/move', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        fen: game.fen(),
+                        sims: p.sims,
+                        cpuct: p.cpuct,
+                        material: p.material,
+                        discount: p.discount
+                    })
+                });
+                const data = await res.json();
+
+                if (data.game_over) {
+                    showGameOver();
+                    return;
+                }
+
+                if (data.error) {
+                    statusEl.textContent = 'Error: ' + data.error;
+                    arenaRunning = false;
+                    return;
+                }
+
+                const move = game.move({
+                    from: data.move.substring(0, 2),
+                    to: data.move.substring(2, 4),
+                    promotion: data.move.length > 4 ? data.move[4] : undefined
+                });
+
+                if (move) {
+                    moveHistory.push(move.san);
+                    board.position(game.fen());
+                    updateHistory();
+                    updateEval(data.evaluation);
+                }
+
+                if (game.game_over()) {
+                    showGameOver();
+                    return;
+                }
+
+                // Continue the arena loop with a delay so the user can follow
+                if (arenaRunning) {
+                    setTimeout(requestArenaMove, 800);
+                }
+            } catch (err) {
+                console.error('Arena error:', err);
+                statusEl.textContent = 'Engine error';
+                arenaRunning = false;
             }
         }
     </script>

@@ -29,7 +29,12 @@ Because the script runs for hours, a crash meant losing everything. I added a `p
 
 I needed a model small enough to fit in 8GB VRAM with a massive batch size (1024+), but deep enough to understand chess strategy. I settled on a **Dual-Headed ResNet**: 10 residual blocks with 128 filters (~1.2M parameters), feeding into a Policy head (4096-dim: where to move) and a Value head (scalar in [-1, 1]: win probability). The board is always encoded from the active player's perspective -- flipped when Black plays -- so the network learns position-agnostic patterns.
 
-Training ran on an RTX 3070 Ti with PyTorch 2.x and Mixed Precision (AMP) to double the effective batch size. The data pipeline feeds from memory-mapped numpy arrays (converted from HDF5) for instant random access, with CosineAnnealingWarmRestarts scheduling, early stopping, and graceful Ctrl+C checkpoint saving.
+Training ran on an RTX 3070 Ti with PyTorch 2.x and Mixed Precision (AMP) to double the effective batch size. The data pipeline feeds from memory-mapped numpy arrays (converted from HDF5) for instant random access.
+
+### Training 2.0: Production Run
+The first training run (10 epochs with CosineAnnealingWarmRestarts) was a proof of concept. For the production run, I built a dedicated training script (`src/train_advanced.py`) designed for 12-48h unattended sessions. It included OneCycleLR scheduling, automatic early stopping (patience=5), graceful SIGINT handling that finishes the current epoch before saving, and full checkpoint resume with optimizer/scheduler state preservation.
+
+The production run trained for **39 epochs** (~26 hours of GPU time across three sessions) before early stopping triggered. The model peaked at **Epoch 34** with a validation loss of **2.1722** and **50.2% top-1 accuracy** on held-out grandmaster moves. After Epoch 34, the validation loss flatlined for 5 consecutive epochs while training loss kept dropping -- the textbook overfitting signal, caught automatically.
 
 ---
 
@@ -108,6 +113,12 @@ The last optimization was migrating inference from raw PyTorch to **ONNX Runtime
 Before calling the project done, I ran a full audit of all 31 files. Found a test that could never actually fail (a misspelled exception name silently swallowed assertion errors), duplicate utility functions scattered across three files with subtle divergence risks, deprecated PyTorch APIs that would break on the next major release, and `sys.path` hacks pointing at the wrong directory. Cleaned all of it -- consolidated the duplicates into a single source of truth, wired configuration constants that had been hardcoded in multiple places, and modernized every import path.
 
 The kind of work nobody sees, but it's the difference between a project and a product.
+
+---
+
+## The Web UI
+
+The Flask web interface started as a simple "play against the engine" page. Over time it gained an evaluation bar, move analysis panel, model hot-swap dropdown, and board editing. The latest addition is **Arena mode** -- two different model checkpoints play against each other automatically, with the status bar showing which model is thinking. This made it trivial to visually compare the old 10-epoch model against the new 34-epoch model and watch the quality difference in real-time.
 
 ---
 

@@ -88,8 +88,15 @@ class HybridEngine:
             model = build_model(self.model_cfg)
             
             # Load weights safely
-            ckpt = torch.load(path, map_location=self.device, weights_only=True)
-            state_dict = ckpt.get("model_state_dict", ckpt)
+            ckpt = torch.load(path, map_location=self.device, weights_only=False)
+            # Support multiple checkpoint formats:
+            #   - raw state_dict (from extract_weights.py or direct save)
+            #   - train.py uses 'model_state_dict'
+            #   - train_advanced.py uses 'model'
+            if isinstance(ckpt, dict):
+                state_dict = ckpt.get("model_state_dict", ckpt.get("model", ckpt))
+            else:
+                state_dict = ckpt
             model.load_state_dict(state_dict)
             
             # Optimization settings
@@ -297,13 +304,22 @@ class HybridEngine:
         # Initialize Rust Core
         tb_path = str(self.model_cfg.syzygy_path) if (self.tablebase and self.model_cfg.syzygy_path) else None
         
-        rust_mcts = chess_engine_core.RustMCTS(
-            board.fen(),
-            kwargs.get("cpuct", 1.25),
-            kwargs.get("discount", 0.90),
-            tb_path,
-            SIMPLIFICATION_FACTOR
-        )
+        try:
+            rust_mcts = chess_engine_core.RustMCTS(
+                board.fen(),
+                kwargs.get("cpuct", 1.25),
+                kwargs.get("discount", 0.90),
+                tb_path,
+                SIMPLIFICATION_FACTOR
+            )
+        except TypeError:
+            # Fallback for older compiled .pyd without simplification_factor
+            rust_mcts = chess_engine_core.RustMCTS(
+                board.fen(),
+                kwargs.get("cpuct", 1.25),
+                kwargs.get("discount", 0.90),
+                tb_path,
+            )
 
         current_sims = 0
         start_time = time.time()
@@ -409,6 +425,6 @@ class HybridEngine:
         ranked = sorted(zip(legal_moves, probs), key=lambda x: -x[1])[:n]
         
         return [
-            {"move": m[0].uci(), "prob": round(float(p), 4)} 
+            {"move": m[0].uci(), "san": board.san(m[0]), "prob": round(float(p), 4)} 
             for m, p in ranked
         ]

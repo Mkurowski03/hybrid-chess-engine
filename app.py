@@ -36,10 +36,10 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__, static_folder="static")
 CORS(app)
 
-# Global Engine Instance
-# We use a container pattern if we needed thread safety, but for a simple 
-# play server, a global reference is standard.
+# Global Engine Instances
 ENGINE: Optional[HybridEngine] = None
+ENGINE_WHITE: Optional[HybridEngine] = None   # Arena mode — white side
+ENGINE_BLACK: Optional[HybridEngine] = None   # Arena mode — black side
 DEFAULT_BOOK = Path("books/opening_book.bin")
 
 
@@ -241,6 +241,90 @@ def api_load_checkpoint():
     except Exception as e:
         logger.error(f"Failed to load checkpoint: {e}")
         return jsonify({"error": str(e)}), 500
+
+
+def _create_engine(path: str) -> HybridEngine:
+    """Creates a HybridEngine from a checkpoint path."""
+    ckpt_path = Path(path)
+    if not ckpt_path.exists():
+        raise FileNotFoundError(f"Checkpoint not found: {path}")
+
+    model_cfg = ModelConfig()
+    config_json = ckpt_path.parent / "config.json"
+    if config_json.exists():
+        try:
+            with open(config_json) as f:
+                saved = json.load(f).get("model", {})
+                if "num_filters" in saved:
+                    model_cfg.num_filters = saved["num_filters"]
+                if "num_residual_blocks" in saved:
+                    model_cfg.num_residual_blocks = saved["num_residual_blocks"]
+        except Exception:
+            pass
+
+    book = str(DEFAULT_BOOK) if DEFAULT_BOOK.exists() else None
+    return HybridEngine(checkpoint_path=ckpt_path, model_cfg=model_cfg, book_path=book)
+
+
+@app.route("/api/arena/load", methods=["POST"])
+def api_arena_load():
+    """Load two models for Arena mode."""
+    global ENGINE_WHITE, ENGINE_BLACK
+    data = request.get_json()
+    white_path = data.get("white")
+    black_path = data.get("black")
+
+    try:
+        if white_path:
+            logger.info(f"Arena: loading WHITE engine from {white_path}")
+            ENGINE_WHITE = _create_engine(white_path)
+        if black_path:
+            logger.info(f"Arena: loading BLACK engine from {black_path}")
+            ENGINE_BLACK = _create_engine(black_path)
+        return jsonify({"status": "success"})
+    except Exception as e:
+        logger.exception("Arena load failed")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/arena/move", methods=["POST"])
+def api_arena_move():
+    """Get a move from the appropriate Arena engine based on turn."""
+    data = request.get_json()
+    try:
+        board = parse_board_input(data)
+    except ValueError:
+        return jsonify({"error": "Invalid FEN/PGN"}), 400
+
+    if board.is_game_over():
+        return jsonify({"game_over": True, "result": board.result()})
+
+    engine = ENGINE_WHITE if board.turn == chess.WHITE else ENGINE_BLACK
+    label = "WHITE" if board.turn == chess.WHITE else "BLACK"
+
+    if not engine:
+        return jsonify({"error": f"{label} engine not loaded"}), 500
+
+    params = {
+        "sims": data.get("sims", 800),
+        "cpuct": data.get("cpuct", 1.25),
+        "material_weight": data.get("material", 0.15),
+        "discount": data.get("discount", 0.90),
+    }
+
+    move = engine.select_move(board, **params)
+    raw_eval = engine.evaluate(board)
+    eval_white = raw_eval if board.turn == chess.WHITE else -raw_eval
+    pv = getattr(engine, 'last_pv', [])
+
+    return jsonify({
+        "move": move.uci(),
+        "san": board.san(move),
+        "evaluation": round(eval_white, 2),
+        "pv": pv,
+        "game_over": False,
+        "engine": label.lower()
+    })
 
 
 def main():

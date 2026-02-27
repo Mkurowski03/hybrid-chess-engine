@@ -5,7 +5,7 @@
 ![PyTorch](https://img.shields.io/badge/ML-PyTorch_CUDA-EE4C2C?logo=pytorch)
 ![License](https://img.shields.io/badge/License-MIT-green)
 
-A hybrid Rust/Python chess engine. Rust handles the MCTS tree search, Python handles GPU inference. Trained on 24M+ grandmaster positions via imitation learning, optimized for consumer hardware (RTX 3070 Ti, 8GB VRAM).
+A hybrid Rust/Python chess engine. Rust handles the MCTS tree search, Python handles GPU inference. Trained on 24M+ grandmaster positions via imitation learning (39 epochs, 50.2% top-1 move accuracy), optimized for consumer hardware (RTX 3070 Ti, 8GB VRAM).
 
 **Estimated strength:** ~2200 Elo (Candidate Master). Defeated a 2450-rated Chess.com bot with 96.8% accuracy and zero blunders.
 
@@ -22,10 +22,11 @@ Board states are 18-channel 8x8 float32 tensors (6 piece types x 2 colors + cast
 
 ### Model
 
-Dual-Headed ResNet (~1.2M parameters):
+Dual-Headed ResNet (~3.5M parameters):
 - **Backbone**: 10 residual blocks, 128 filters each
 - **Policy head**: 4096-dim output (from_sq * 64 + to_sq)
 - **Value head**: Scalar in [-1, 1]
+- **Training**: OneCycleLR, early stopping (patience=5), 39 epochs, val_acc 50.2%
 
 ### Performance
 
@@ -58,6 +59,11 @@ Dual-Headed ResNet (~1.2M parameters):
 - Adaptive allocation (up to 16% of remaining clock on critical moves)
 - Panic mode: scales down simulations when clock drops below 5 seconds
 
+**Web UI**
+- Play against the engine, watch it play itself, or run model-vs-model Arena matches
+- Live evaluation bar, top moves analysis, principal variation display
+- Hot-swap between model checkpoints mid-game
+
 ---
 
 ## Quick Start
@@ -71,14 +77,11 @@ pip install -r requirements.txt
 # Compile the Rust core
 maturin develop --release
 
-# (Optional) Export ONNX model for faster inference
-python scripts/export_onnx.py --checkpoint checkpoints/baseline/chessnet_epoch9.pt
-
-# Run the web UI
+# Run the web UI (auto-loads latest checkpoint)
 python app.py
 
 # Or run as a UCI engine (for Arena, BanksiaGUI, cutechess-cli)
-python src/uci.py --model checkpoints/baseline/chessnet_epoch9.pt
+python src/uci.py --model checkpoints/baseline_v2/best_model.pt
 ```
 
 ---
